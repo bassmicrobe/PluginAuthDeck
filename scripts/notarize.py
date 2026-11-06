@@ -215,7 +215,7 @@ def prepare(run, state, commands):
     commands.call('copy-source', ['/usr/bin/ditto', source, app], timeout=300)
     if tree_digest(app) != state['source_digest']:
         raise RuntimeError('Staged app copy differs from the source.')
-    commands.call('clear-staged-xattrs', ['/usr/bin/xattr', '-cr', app])
+    commands.call('clear-staged-signing-metadata', [sys.executable, ROOT / 'scripts/signing_metadata.py', app])
     state['stage'] = 'signing_helper'
     atomic_json(run / 'state.json', state)
     sign = ['/usr/bin/codesign', '--force', '--sign', state['identity'], '--keychain', state['keychain'], '--options', 'runtime', '--timestamp']

@@ -7,6 +7,7 @@ callbacks are in-memory fakes: no plug-in, GUI, audio, or child process starts.
 """
 from pathlib import Path
 import csv
+import os
 import subprocess
 import tempfile
 
@@ -35,14 +36,14 @@ final class Hosts {
     init(directory: URL, base: Date) { self.directory = directory; self.base = base }
 
     func attach(_ scanner: AutomaticScanner) {
-        scanner.launch = { [weak self] task in
-            guard let self = self else { return nil }
+        scanner.launch = { [weak self, weak scanner] task in
+            guard let self = self, let scanner = scanner else { return nil }
             self.attempts += 1
             // Verify the real controller durably checkpoints before its launch
             // callback. Read raw JSON because AutoScanStore safely recovers a
             // running checkpoint as paused when a new reader opens it.
             let saved = (0..<AutomaticScanner.workerCount).contains { worker in
-                let file = self.directory.appendingPathComponent("worker-\(worker)/autoscan-state.json")
+                let file = scanner.checkpointDirectory.appendingPathComponent("worker-\(worker)/autoscan-state.json")
                 guard let data = try? Data(contentsOf: file),
                       let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let run = doc["run"] as? [String: Any],
@@ -108,6 +109,16 @@ final class Hosts {
 
     static func run() throws {
         let root = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+        if let mode = CommandLine.arguments.dropFirst(2).first, mode.hasPrefix("--nonregular-") {
+            let scanner = AutomaticScanner(directory: root, automaticallyTick: false)
+            if mode.hasSuffix("-lock") {
+                scanner.start(tasks: [AutoScanTask(entry: try entry(root, 999))])
+            }
+            try expect(!scanner.error.isEmpty && scanner.runs.isEmpty && !scanner.canResume,
+                "nonregular state or lock fails promptly without creating a replacement run")
+            print("PASS: \(mode) rejected without blocking")
+            return
+        }
         let entries = try (0..<8).map { try entry(root, $0) }
         let tasks = entries.map { AutoScanTask(entry: $0) }
         let base = Date()
@@ -310,7 +321,7 @@ final class Hosts {
         let queueHosts = Hosts(directory: queueDir, base: base)
         queueHosts.attach(queue)
         queue.start(tasks: Array(tasks.prefix(2)))
-        let checkpoint = queueDir.appendingPathComponent("worker-0/autoscan-state.json")
+        let checkpoint = queue.checkpointDirectory.appendingPathComponent("worker-0/autoscan-state.json")
         var altered = try Data(contentsOf: checkpoint)
         altered.append(Data("\n".utf8))
         try altered.write(to: checkpoint)
@@ -319,6 +330,108 @@ final class Hosts {
         queue.tick(now: base)
         try expect(!queue.error.isEmpty && Set(queueHosts.stops) == Set(queueHosts.launchOrder), "queue checkpoint conflict stops every owned host")
         try expect(try Data(contentsOf: checkpoint) == altered, "external checkpoint bytes preserved on conflict")
+
+        // Starting a scan replaces both workers together. A second-worker
+        // conflict must preserve every previous result and never launch a host.
+        let atomicDir = root.appendingPathComponent("atomic-start")
+        let atomic = AutomaticScanner(directory: atomicDir, automaticallyTick: false)
+        let atomicHosts = Hosts(directory: atomicDir, base: base)
+        atomicHosts.failLaunch = true
+        atomicHosts.attach(atomic)
+        atomic.start(tasks: Array(tasks.prefix(2)))
+        let previousResults = atomic.results
+        let previousDirectory = atomic.checkpointDirectory
+        let previousManifest = try Data(contentsOf: atomicDir.appendingPathComponent("current-run.json"))
+        let secondWorker = previousDirectory.appendingPathComponent("worker-1/autoscan-state.json")
+        let modifiedSecondWorker = try Data(contentsOf: secondWorker) + Data("\n".utf8)
+        try modifiedSecondWorker.write(to: secondWorker)
+        let previousAttempts = atomicHosts.attempts
+        atomic.start(tasks: Array(tasks.suffix(2)))
+        try expect(!atomic.error.isEmpty && atomicHosts.attempts == previousAttempts,
+            "second-worker conflict prevents every new launch")
+        try expect(atomic.results == previousResults && atomic.checkpointDirectory == previousDirectory,
+            "failed start leaves all old workers and in-memory results intact")
+        try expect(try Data(contentsOf: atomicDir.appendingPathComponent("current-run.json")) == previousManifest,
+            "failed start does not switch the active run manifest")
+        atomic.reload()
+        try expect(atomic.results == previousResults && atomic.isComplete && !atomic.canResume,
+            "reload after failed start never combines old results with a new queue")
+        atomic.start(tasks: Array(tasks.suffix(2)))
+        try expect(atomic.isComplete && atomic.results.map(\.id) == tasks.suffix(2).map(\.id)
+            && atomic.checkpointDirectory != previousDirectory, "retry publishes a complete new generation")
+        try expect(try Data(contentsOf: secondWorker) == modifiedSecondWorker,
+            "successful replacement retains previous generation for recovery")
+
+        // The second worker exceeds the durable size limit after the first
+        // worker is staged: failure still cannot publish a partial generation.
+        let workspace = try AutoScanWorkspace(directory: atomicDir)
+        let priorStores = try workspace.stores(count: AutomaticScanner.workerCount)
+        let beforeOversized = try Data(contentsOf: atomicDir.appendingPathComponent("current-run.json"))
+        let beforeDirectories = try FileManager.default.contentsOfDirectory(atPath: atomicDir.appendingPathComponent("runs").path)
+        var oversized = AutoScanRun(tasks: [tasks[0]])
+        oversized.resume(); _ = oversized.beginNext()
+        try oversized.finishCurrent(outcome: .inconclusive, reason: String(repeating: "x", count: 16 * 1024 * 1024))
+        var rejectedOversized = false
+        do { _ = try workspace.replace(with: [AutoScanRun(tasks: [tasks[1]]), oversized], previous: priorStores) }
+        catch { rejectedOversized = true }
+        try expect(rejectedOversized, "second staged checkpoint rejects oversized data")
+        try expect(try Data(contentsOf: atomicDir.appendingPathComponent("current-run.json")) == beforeOversized,
+            "second staged write failure leaves the active manifest unchanged")
+        try expect(try Set(FileManager.default.contentsOfDirectory(atPath: atomicDir.appendingPathComponent("runs").path)) == Set(beforeDirectories),
+            "failed unpublished generation is removed without touching previous generations")
+
+        // An old controller cannot overwrite a newly published generation.
+        let competing = AutomaticScanner(directory: atomicDir, automaticallyTick: false)
+        let competingHosts = Hosts(directory: atomicDir, base: base)
+        competingHosts.failLaunch = true
+        competingHosts.attach(competing)
+        atomic.start(tasks: Array(tasks.prefix(2)))
+        let latestManifest = try Data(contentsOf: atomicDir.appendingPathComponent("current-run.json"))
+        competing.start(tasks: Array(tasks.suffix(2)))
+        try expect(!competing.error.isEmpty && competingHosts.attempts == 0,
+            "stale manifest prevents another controller replacing the current run")
+        try expect(try Data(contentsOf: atomicDir.appendingPathComponent("current-run.json")) == latestManifest,
+            "manifest conflict preserves the newer run")
+
+        let legacyDir = root.appendingPathComponent("legacy-migration")
+        for index in 0..<AutomaticScanner.workerCount {
+            var legacyRun = AutoScanRun(tasks: [tasks[index]])
+            legacyRun.resume(); _ = legacyRun.beginNext()
+            try legacyRun.finishCurrent(outcome: .inconclusive, reason: "legacy-fixture")
+            try AutoScanStore(directory: legacyDir.appendingPathComponent("worker-\(index)")).save(legacyRun)
+        }
+        let legacyFile = legacyDir.appendingPathComponent("worker-0/autoscan-state.json")
+        let legacyBytes = try Data(contentsOf: legacyFile)
+        let legacy = AutomaticScanner(directory: legacyDir, automaticallyTick: false)
+        try expect(legacy.completedCount == 2 && legacy.isComplete && legacy.checkpointDirectory == legacyDir,
+            "old worker directories load without a manifest")
+        let legacyHosts = Hosts(directory: legacyDir, base: base)
+        legacyHosts.failLaunch = true
+        legacyHosts.attach(legacy)
+        legacy.start(tasks: Array(tasks.suffix(2)))
+        try expect(legacy.isComplete && legacy.checkpointDirectory != legacyDir,
+            "starting from legacy storage publishes the new complete generation")
+        try expect(try Data(contentsOf: legacyFile) == legacyBytes, "migration preserves all legacy checkpoint bytes")
+        let migrated = AutomaticScanner(directory: legacyDir, automaticallyTick: false)
+        try expect(migrated.results == legacy.results && migrated.isComplete,
+            "reload follows the new manifest instead of stale legacy checkpoints")
+
+        for (name, document) in [
+            ("broken", Data("{broken".utf8)),
+            ("unknown", Data("{\"version\":2,\"directory\":\"\(UUID().uuidString)\"}".utf8)),
+            ("escape", Data("{\"version\":1,\"directory\":\"../../outside\"}".utf8)),
+            ("missing", Data("{\"version\":1,\"directory\":\"\(UUID().uuidString)\"}".utf8))
+        ] {
+            let invalidDir = root.appendingPathComponent("manifest-" + name)
+            try FileManager.default.createDirectory(at: invalidDir, withIntermediateDirectories: true)
+            let manifest = invalidDir.appendingPathComponent("current-run.json")
+            try document.write(to: manifest)
+            let invalid = AutomaticScanner(directory: invalidDir, automaticallyTick: false)
+            invalid.start(tasks: Array(tasks.prefix(2)))
+            try expect(!invalid.error.isEmpty && invalid.runs.isEmpty && !invalid.canResume,
+                "invalid or incomplete manifest is rejected: " + name)
+            try expect(try Data(contentsOf: manifest) == document, "invalid manifest is never overwritten: " + name)
+        }
 
         // Product metadata expands siblings exactly once, with known siblings
         // excluded and repeated polls producing no redundant @Published run.
@@ -395,11 +508,18 @@ final class Hosts {
         }
         try AutoScanStore(directory: csvDir.appendingPathComponent("worker-0")).save(csvRun)
         let csvScanner = AutomaticScanner(directory: csvDir, automaticallyTick: false)
-        csvScanner.writeReport()
+        try expect(csvScanner.writeReport(), "successful CSV export confirms the file can be opened")
         try expect(csvScanner.isComplete && csvScanner.results.count == csvValues.count,
             "CSV fixture exports actual stored results without opening any plugins")
+        let priorReport = try Data(contentsOf: csvScanner.reportURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: csvDir.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: csvDir.path) }
+        try expect(!csvScanner.writeReport(), "CSV write failure tells the caller not to open a stale report")
+        try expect(csvScanner.message.contains("CSVを書き出せません"), "CSV write failure remains visible to the user")
+        try expect(try Data(contentsOf: csvScanner.reportURL) == priorReport,
+            "failed atomic CSV replacement preserves the previous report")
 
-        for controller in [restored, timed, conflict, queue, classes, missing, failures, changed] { controller.shutdown() }
+        for controller in [restored, timed, conflict, queue, atomic, competing, legacy, migrated, classes, missing, failures, changed] { controller.shutdown() }
         print("PASS: \(checks) AutomaticScanner integration checks (durability, max-two, exits, deadlines, pause/resume, conflicts, classes)")
     }
 }
@@ -417,6 +537,15 @@ def main():
             *(str(ROOT / name) for name in ("Inventory.swift", "AutoScan.swift", "AutomaticScanner.swift")),
             str(harness), "-o", str(binary),
         ], check=True, timeout=120)
+        for mode, name in [("checkpoint", "worker-0/autoscan-state.json"),
+                           ("lock", "worker-0/.autoscan-state.lock"),
+                           ("manifest", "current-run.json"), ("run-lock", ".autoscan-run.lock")]:
+            fifo_root = directory / f"fifo-{mode}"
+            fifo = fifo_root / name
+            fifo.parent.mkdir(parents=True)
+            os.mkfifo(fifo)
+            subprocess.run([str(binary), str(fifo_root), f"--nonregular-{mode}"], check=True, timeout=2)
+            assert fifo.is_fifo(), "rejected state and lock must remain untouched"
         subprocess.run([str(binary), str(directory)], check=True, timeout=30)
         with (directory / "csv-cells" / "自動チェック結果.csv").open(encoding="utf-8-sig", newline="") as stream:
             rows = list(csv.reader(stream))

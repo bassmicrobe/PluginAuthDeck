@@ -30,6 +30,8 @@ python3 scripts/notarize.py \
 
 ホストを先にDeveloper ID・Hardened Runtime・安全なタイムスタンプ付きで署名します。ホストに許可する例外は、異なる提供元のプラグインを読み込むための`com.apple.security.cs.disable-library-validation`だけです。ランチャーに例外は付けません。その後、厳密な署名検証、各アーキテクチャ、署名証明書、Team ID、runtime、タイムスタンプ、entitlementsを確認します。
 
+作業コピーでは署名を妨げる`com.apple.FinderInfo`と`com.apple.ResourceFork`だけを削除します。隔離属性（quarantine）や由来情報（provenance）は保持し、Gatekeeperの設定を変更しません。
+
 ランチャーはarm64、ホストはarm64 / x86_64です。配布ZIPはランチャーに合わせて`PluginAuthDesk-macOS-arm64-v<version>.zip`と命名します。Universalアプリとしては配布しません。
 
 署名時に鍵へのアクセスが待ち続ける場合、コマンドは時間制限で終了し、作業コピーとログを残します。安全な操作で鍵へのアクセスを解決した後、表示された`RUN_DIR`を`--resume ... --prepare-only`へ渡すと準備を再開できます。未完了の準備を再開すると、以前の作業コピーをrun内の`failed-preparation-...app`へ退避し、内容が変わっていない元ビルドを新規コピーして、ホストから署名し直します。中断されたcodesignの一時ファイルを次の署名へ混入させないためです。コピー途中や署名検証中の中断でも同様です。元ビルドが変わった場合は、新しいrunを作成してください。申請IDを保存したrunへ、この再署名処理を適用することはありません。

@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Compile: swiftc Inventory.swift inventory_tests.swift -o /tmp/auth-inventory-tests
 import Foundation
+import Darwin
 
 @main
 struct InventoryTests {
     static func main() throws {
+        if CommandLine.arguments.count == 3 {
+            let path = CommandLine.arguments[2]
+            let rejected = CommandLine.arguments[1] == "--metadata-probe"
+                ? Inventory.boundedData(path) == nil : Inventory.architectures(path).isEmpty
+            exit(rejected ? 0 : 1)
+        }
         let fm = FileManager.default
         let root = fm.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("auth-inventory-tests-" + UUID().uuidString)
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
@@ -126,6 +133,26 @@ struct InventoryTests {
         let giant = root.appendingPathComponent("large.plist")
         try Data(repeating: 65, count: 4 * 1024 * 1024 + 1).write(to: giant)
         check(Inventory.plist(giant.path).isEmpty, "oversized metadata is ignored")
+        let regular = root.appendingPathComponent("regular-metadata")
+        try armHeader.write(to: regular)
+        check(Inventory.boundedData(regular.path, limit: armHeader.count) == armHeader,
+              "regular metadata is accepted exactly at the byte limit")
+        check(Inventory.boundedData(regular.path, limit: armHeader.count - 1) == nil,
+              "metadata one byte over the limit is rejected")
+        for invalidLimit in [0, -1, Int.max] {
+            check(Inventory.boundedData(regular.path, limit: invalidLimit) == nil, "invalid byte budget is rejected")
+        }
+        let regularAlias = root.appendingPathComponent("regular-alias")
+        try fm.createSymbolicLink(at: regularAlias, withDestinationURL: regular)
+        check(Inventory.boundedData(regularAlias.path) == armHeader, "regular-file aliases remain supported")
+        check(Inventory.boundedData(root.path) == nil, "directory metadata is rejected")
+        let sparse = root.appendingPathComponent("sparse-executable")
+        try armHeader.write(to: sparse)
+        let sparseHandle = try FileHandle(forWritingTo: sparse)
+        try sparseHandle.truncate(atOffset: UInt64(1) << 40)
+        try sparseHandle.close()
+        check(Inventory.boundedData(sparse.path) == nil, "huge sparse metadata is rejected before allocation")
+        check(Inventory.architectures(sparse.path) == ["arm64"], "architecture discovery reads only the bounded header of large binaries")
 
         // Same bundle name from two AU vendors must not mislabel the VST3 with
         // whichever vendor happened to be visited last.
@@ -149,6 +176,34 @@ struct InventoryTests {
         refreshedShared = scan().filter { $0.path == sharedEntries[0].path }.sorted { $0.id < $1.id }
         check(refreshedShared[0].enumeratedClassIDs == ["au-first"] && refreshedShared[1].enumeratedClassIDs == ["au-second"],
               "each AU component keeps its own class catalog through refresh")
+        let catalogURL = catalogRoot.appendingPathComponent("class-catalog.json")
+        let savedCatalog = try Data(contentsOf: catalogURL)
+        let oversizedNames = (0..<4096).map { String(format: "%04d", $0) + String(repeating: "x", count: 1020) }
+        check(Inventory.rememberClasses(for: sharedEntries[0], names: oversizedNames, directory: catalogRoot) == nil,
+              "a catalog larger than the read limit cannot replace the readable cache")
+        let catalogAfterRejection = try Data(contentsOf: catalogURL)
+        check(catalogAfterRejection == savedCatalog, "rejected oversized catalog preserves previous bytes")
+
+        // A malformed bundle must not block inventory forever while opening a
+        // FIFO. Run each probe in a disposable process with a strict deadline.
+        let fifo = root.appendingPathComponent("metadata.fifo")
+        check(mkfifo(fifo.path, mode_t(0o600)) == 0, "create writerless FIFO fixture")
+        let fifoAlias = root.appendingPathComponent("fifo-alias")
+        try fm.createSymbolicLink(at: fifoAlias, withDestinationURL: fifo)
+        for path in [fifo, fifoAlias] {
+            for mode in ["--metadata-probe", "--architecture-probe"] {
+                let probe = Process()
+                probe.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+                probe.arguments = [mode, path.path]
+                try probe.run()
+                let deadline = Date().addingTimeInterval(2)
+                while probe.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
+                let blocked = probe.isRunning
+                if blocked { kill(probe.processIdentifier, SIGKILL) }
+                probe.waitUntilExit()
+                check(!blocked && probe.terminationStatus == 0, "special metadata files are rejected without blocking: " + mode)
+            }
+        }
         print("PASS: \(assertions) inventory/cache fixtures")
     }
 }

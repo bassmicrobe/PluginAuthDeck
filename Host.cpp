@@ -5,6 +5,41 @@
 
 namespace HostRequestPolicy
 {
+constexpr std::size_t maxRequestBytes = 65536;
+constexpr std::size_t maxRequestDepth = 32;
+
+// Bound recursion before handing local files to the dependency's JSON parser.
+// This is a structural preflight, not a replacement for JSON syntax validation.
+bool hasSafeJSONEnvelope(std::string_view json)
+{
+    if (json.empty() || json.size() > maxRequestBytes) return false;
+    std::vector<char> containers;
+    bool quoted = false, escaped = false;
+    for (const char byte : json)
+    {
+        if (byte == '\0') return false;
+        if (quoted)
+        {
+            if (escaped) escaped = false;
+            else if (byte == '\\') escaped = true;
+            else if (byte == '"') quoted = false;
+            continue;
+        }
+        if (byte == '"') quoted = true;
+        else if (byte == '{' || byte == '[')
+        {
+            if (containers.size() >= maxRequestDepth) return false;
+            containers.push_back(byte);
+        }
+        else if (byte == '}' || byte == ']')
+        {
+            if (containers.empty() || containers.back() != (byte == '}' ? '{' : '[')) return false;
+            containers.pop_back();
+        }
+    }
+    return !quoted && containers.empty();
+}
+
 enum class Mode { manual, scan, invalid };
 Mode parseMode(std::string_view mode)
 {
@@ -40,12 +75,45 @@ bool isAUUnauthorized(std::string_view format, std::string_view classID, std::st
 #ifndef PLUGIN_AUTH_HOST_POLICY_TEST
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_extra/juce_gui_extra.h>
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <fcntl.h>
+#include <optional>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #include "LicenseProbe.h"
 using namespace juce;
+
+namespace
+{
+std::optional<std::string> readRequestFile(const File& request)
+{
+    // A FIFO can pass JUCE existsAsFile() and block open before our watchdog
+    // starts. Open without blocking/following links and inspect that same fd.
+    const int descriptor = ::open(request.getFullPathName().toRawUTF8(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    if (descriptor < 0) return std::nullopt;
+    const auto closer = ScopeGuard { [descriptor] { ::close(descriptor); } };
+    struct stat metadata {};
+    if (::fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode)
+        || metadata.st_size < 0 || metadata.st_size > static_cast<off_t>(HostRequestPolicy::maxRequestBytes))
+        return std::nullopt;
+    std::string bytes;
+    std::array<char, 4096> buffer {};
+    while (bytes.size() <= HostRequestPolicy::maxRequestBytes)
+    {
+        const auto remaining = HostRequestPolicy::maxRequestBytes + 1 - bytes.size();
+        const auto count = ::read(descriptor, buffer.data(), std::min(buffer.size(), remaining));
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) return std::nullopt;
+        if (count == 0) return bytes;
+        bytes.append(buffer.data(), static_cast<std::size_t>(count));
+    }
+    return std::nullopt; // The file grew beyond the bound after fstat.
+}
+}
 
 // One selected plug-in per process. No AudioDeviceManager, MIDI device, audio
 // callback, prepareToPlay(), or network client is created by this host.
@@ -62,11 +130,15 @@ public:
         if (args.size() != 2 || args[0] != "--request") { setApplicationReturnValue(2); quit(); return; }
         if (!File::isAbsolutePath(args[1])) { setApplicationReturnValue(2); quit(); return; }
         File request(args[1]);
-        if (!request.existsAsFile() || request.getSize() > 65536) { setApplicationReturnValue(2); quit(); return; }
+        const auto bytes = readRequestFile(request);
+        if (!bytes) { setApplicationReturnValue(2); quit(); return; }
         statusFile = request.getSiblingFile("status.json");
         heartbeatFile = request.getSiblingFile("heartbeat.json");
         quitFile = request.getSiblingFile("quit.request");
-        config = JSON::parse(request);
+        if (!HostRequestPolicy::hasSafeJSONEnvelope(*bytes)
+            || !CharPointer_UTF8::isValidString(bytes->data(), static_cast<int>(bytes->size())))
+        { fail("Invalid launch request"); return; }
+        config = JSON::parse(String::fromUTF8(bytes->data(), static_cast<int>(bytes->size())));
         const auto mode = HostRequestPolicy::parseMode(config["mode"].toString().toStdString());
         scanMode = mode == HostRequestPolicy::Mode::scan;
         if (mode == HostRequestPolicy::Mode::invalid) { fail("Invalid launch mode"); return; }
@@ -439,6 +511,13 @@ int main()
     assert(parseMode("scan") == Mode::scan);
     assert(parseMode("SCAN") == Mode::invalid);
     assert(parseMode("anything-else") == Mode::invalid);
+    assert(hasSafeJSONEnvelope(R"({"name":"日本語 🎛️ [quoted]", "escaped":"\\\"{"})"));
+    assert(hasSafeJSONEnvelope(std::string(maxRequestDepth, '[') + "0" + std::string(maxRequestDepth, ']')));
+    assert(!hasSafeJSONEnvelope(std::string(30000, '[') + "0" + std::string(30000, ']')));
+    assert(!hasSafeJSONEnvelope("{[}]"));
+    assert(!hasSafeJSONEnvelope("{\"name\":\"unterminated}"));
+    assert(!hasSafeJSONEnvelope(std::string("{}\0[]", 5)));
+    assert(!hasSafeJSONEnvelope(std::string(maxRequestBytes + 1, ' ')));
     const std::vector<std::string> classes {"exact-first", "exact-second"};
     assert(chooseClass(classes, "", false) == -1);
     assert(chooseClass(classes, "", true) == 0);
@@ -459,6 +538,6 @@ int main()
     assert(!isAUUnauthorized("AU", "selected-class", unauthorized + " extra text"));
     assert(!isAUUnauthorized("AU", "selected-class", "-10847"));
     assert(!isAUUnauthorized("AU", "selected-class", ""));
-    std::cout << "PASS: 23 request mode, exact class-selection, and AU authorization policy cases\n";
+    std::cout << "PASS: 30 request bounds, mode, exact class-selection, and AU authorization policy cases\n";
 }
 #endif

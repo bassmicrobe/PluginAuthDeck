@@ -1,5 +1,39 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import Foundation
+import Darwin
+
+enum LocalFileReadError: Error {
+    case missing, unreadable, tooLarge
+}
+
+/// Metadata and saved state are regular files. A FIFO/device must not block
+/// startup before the caller has a chance to report or ignore malformed input.
+enum LocalFileReader {
+    static func read(_ path: String, maximumBytes: Int, requireCompleteFile: Bool = true) throws -> Data {
+        guard maximumBytes > 0, maximumBytes < Int.max, !path.contains("\0") else {
+            throw LocalFileReadError.unreadable
+        }
+        let descriptor = Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
+        guard descriptor >= 0 else {
+            if errno == ENOENT { throw LocalFileReadError.missing }
+            throw LocalFileReadError.unreadable
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_size >= 0 else {
+            throw LocalFileReadError.unreadable
+        }
+        if requireCompleteFile && info.st_size > maximumBytes { throw LocalFileReadError.tooLarge }
+        let expected = min(Int(info.st_size), maximumBytes)
+        let data: Data
+        do { data = try handle.read(upToCount: expected + (requireCompleteFile ? 1 : 0)) ?? Data() }
+        catch { throw LocalFileReadError.unreadable }
+        guard !requireCompleteFile || data.count <= maximumBytes else { throw LocalFileReadError.tooLarge }
+        guard !requireCompleteFile || data.count == expected else { throw LocalFileReadError.unreadable }
+        return data
+    }
+}
 
 struct Entry: Identifiable, Codable, Hashable {
     var id: String
@@ -42,15 +76,13 @@ extension Entry {
 }
 
 enum Inventory {
+    static let metadataMaximumBytes = 4 * 1024 * 1024
     static let home = FileManager.default.homeDirectoryForCurrentUser.path
     static let support = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/Plugin Auth Desk")
 
-    static func boundedData(_ path: String, limit: Int = 4 * 1024 * 1024) -> Data? {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
-        defer { try? handle.close() }
-        guard let data = try? handle.read(upToCount: limit + 1), data.count <= limit else { return nil }
-        return data
+    static func boundedData(_ path: String, limit: Int = metadataMaximumBytes) -> Data? {
+        try? LocalFileReader.read(path, maximumBytes: limit)
     }
 
     static func plist(_ path: String) -> [String: Any] {
@@ -62,9 +94,7 @@ enum Inventory {
 
     // Read at most 4 KiB; never execute/load a plug-in to discover architectures.
     static func architectures(_ path: String) -> [String] {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return [] }
-        defer { try? handle.close() }
-        guard let data = try? handle.read(upToCount: 4096) else { return [] }
+        guard let data = try? LocalFileReader.read(path, maximumBytes: 4096, requireCompleteFile: false) else { return [] }
         let b = [UInt8](data)
         func u32(_ i: Int, _ little: Bool = false) -> UInt32 {
             guard i + 4 <= b.count else { return 0 }
@@ -201,6 +231,7 @@ enum Inventory {
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let data = try JSONEncoder().encode(catalog)
+            guard data.count <= metadataMaximumBytes else { return nil }
             try data.write(to: directory.appendingPathComponent("class-catalog.json"), options: .atomic)
         } catch { return nil }
         var updated = entry

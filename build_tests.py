@@ -7,6 +7,7 @@ import pathlib
 import plistlib
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -149,6 +150,54 @@ class InstallerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'symlinked'):
             self.install()
         self.assertEqual(self.marker(original), 'old')
+
+
+class SigningMetadataTests(unittest.TestCase):
+    def set_attribute(self, path, name, value):
+        subprocess.run(['/usr/bin/xattr', '-w', '-x', name, value.hex(), str(path)], check=True)
+
+    def attribute(self, path, name):
+        value = subprocess.check_output(['/usr/bin/xattr', '-p', '-x', name, str(path)], text=True)
+        return bytes.fromhex(value)
+
+    def attributes(self, path):
+        return subprocess.check_output(['/usr/bin/xattr', str(path)], text=True).splitlines()
+
+    def test_cleanup_preserves_quarantine_and_unrelated_attributes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = pathlib.Path(directory) / 'Synthetic.app'
+            resource = app / 'Contents/Resources/日本語 fixture.txt'
+            resource.parent.mkdir(parents=True)
+            resource.write_text('synthetic resource')
+            quarantine = b'0081;00000000;Synthetic Test;'
+            for path in (app, resource):
+                self.set_attribute(path, 'com.apple.quarantine', quarantine)
+                self.set_attribute(path, 'org.pluginauthdesk.fixture', b'keep')
+                self.set_attribute(path, 'com.apple.FinderInfo', b'TEXT' + bytes(28))
+            self.set_attribute(resource, 'com.apple.ResourceFork', b'synthetic resource fork')
+            subprocess.run([sys.executable, str(build.ROOT / 'scripts/signing_metadata.py'), str(app)], check=True)
+            for path in (app, resource):
+                self.assertEqual(self.attribute(path, 'com.apple.quarantine'), quarantine)
+                self.assertEqual(self.attribute(path, 'org.pluginauthdesk.fixture'), b'keep')
+                self.assertNotIn('com.apple.FinderInfo', self.attributes(path))
+                self.assertNotIn('com.apple.ResourceFork', self.attributes(path))
+
+    def test_cleanup_rejects_symlinks_before_changing_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            app = root / 'Synthetic.app'
+            app.mkdir()
+            outside = root / 'outside.txt'
+            outside.write_text('outside the generated bundle')
+            self.set_attribute(app, 'com.apple.FinderInfo', b'TEXT' + bytes(28))
+            self.set_attribute(outside, 'com.apple.FinderInfo', b'TEXT' + bytes(28))
+            (app / 'link').symlink_to(outside)
+            result = subprocess.run([sys.executable, str(build.ROOT / 'scripts/signing_metadata.py'), str(app)],
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('symlink', result.stderr)
+            self.assertIn('com.apple.FinderInfo', self.attributes(app))
+            self.assertIn('com.apple.FinderInfo', self.attributes(outside))
 
 
 class SourceArchiveTests(unittest.TestCase):

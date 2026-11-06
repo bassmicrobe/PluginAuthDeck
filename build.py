@@ -39,7 +39,7 @@ SOURCE_FILES = (
     'tests/fixture/Fixture.cpp', 'tests/fixture/README.md',
     'tests/fixture/verify_installed_host.py',
     'docs/NOTARIZATION.md', 'packaging/host-entitlements.plist',
-    'scripts/notarize.py', 'scripts/notarize_tests.py',
+    'scripts/notarize.py', 'scripts/notarize_tests.py', 'scripts/signing_metadata.py',
 )
 
 
@@ -265,8 +265,8 @@ def build_app():
         shutil.copy2(name, contents/'Resources'/name)
     shutil.copy2('JUCE/LICENSE.md', contents/'Resources/JUCE-LICENSE.md')
     shutil.copy2('JUCE/JUCE.spdx.json', contents/'Resources/JUCE.spdx.json')
-    # Strip copied Finder metadata from this generated bundle only.
-    run(['/usr/bin/xattr', '-cr', app])
+    # Strip only signing-incompatible Finder metadata; preserve quarantine.
+    run([sys.executable, ROOT/'scripts/signing_metadata.py', app])
     run(['codesign', '--force', '--sign', '-', helper])
     run(['codesign', '--force', '--sign', '-', app])
     verify_app(app)

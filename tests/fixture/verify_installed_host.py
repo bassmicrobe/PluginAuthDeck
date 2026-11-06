@@ -16,6 +16,7 @@ from pathlib import Path
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -62,10 +63,11 @@ def main():
     with tempfile.TemporaryDirectory(prefix='plugin-auth-host-fixture-', dir=staging_root) as temporary:
         directory = Path(temporary)
         staged_plugin = directory / 'Plugin Auth Desk Fixture.vst3'
-        shutil.copytree(plugin, staged_plugin, copy_function=shutil.copyfile)
+        shutil.copytree(plugin, staged_plugin, copy_function=shutil.copy2)
         staged_binary = staged_plugin / 'Contents/MacOS/Plugin Auth Desk Fixture'
         staged_binary.chmod(0o755)
-        subprocess.run(['/usr/bin/xattr', '-cr', str(staged_plugin)], check=True, timeout=5)
+        subprocess.run([sys.executable, str(repository / 'scripts/signing_metadata.py'), str(staged_plugin)],
+                       check=True, timeout=65)
         subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', '--timestamp=none', str(staged_plugin)],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
         subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(staged_plugin)],

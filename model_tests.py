@@ -107,8 +107,34 @@ enum FixtureFailure: Error, CustomStringConvertible {
         }
     }
 
+    static func inventoryCacheFixtures(_ root: URL) throws {
+        let support = root.appendingPathComponent("cache-fixtures")
+        let cache = support.appendingPathComponent("inventory.json")
+        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        let invalid = DeskModel(directory: support, refreshOnLaunch: false)
+        try expect(invalid.entries.isEmpty && !invalid.inventoryError.isEmpty,
+            "non-file inventory cache is rejected with a visible recovery message")
+        try FileManager.default.removeItem(at: cache)
+        try expect(mkfifo(cache.path, mode_t(0o600)) == 0, "create isolated inventory FIFO")
+        let start = Date()
+        let piped = DeskModel(directory: support, refreshOnLaunch: false)
+        try expect(piped.entries.isEmpty && !piped.inventoryError.isEmpty && Date().timeIntervalSince(start) < 2,
+            "inventory FIFO cannot block application startup")
+        try FileManager.default.removeItem(at: cache)
+        try Data("{broken".utf8).write(to: cache)
+        let corrupt = DeskModel(directory: support, refreshOnLaunch: false)
+        try expect(corrupt.entries.isEmpty && !corrupt.inventoryError.isEmpty,
+            "malformed inventory reports its recovery path")
+        let entry = try bundle(root, name: "音色 🎹 cache", format: "VST3")
+        try JSONEncoder().encode([entry]).write(to: cache, options: .atomic)
+        let recovered = DeskModel(directory: support, refreshOnLaunch: false)
+        try expect(recovered.entries == [entry] && recovered.inventoryError.isEmpty,
+            "valid Unicode inventory loads after the invalid cache is replaced")
+    }
+
     static func run() throws {
         let root = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+        try inventoryCacheFixtures(root)
         try reportReaderFixtures(root)
         let support = root.appendingPathComponent("support")
         let a = try bundle(root, name: "BundleA", format: "VST3")
@@ -136,6 +162,32 @@ enum FixtureFailure: Error, CustomStringConvertible {
         }
         let started = Date().addingTimeInterval(-0.5)
         let observed = Date().timeIntervalSince1970
+        let cacheFailureSupport = root.appendingPathComponent("cache-write-failure")
+        let blockedCache = cacheFailureSupport.appendingPathComponent("inventory.json")
+        try FileManager.default.createDirectory(at: blockedCache, withIntermediateDirectories: true)
+        let cacheFailure = DeskModel(directory: cacheFailureSupport, initialEntries: [a], refreshOnLaunch: false)
+        cacheFailure.inventoryError = ""
+        let cacheReport = cacheFailureSupport.appendingPathComponent("session")
+        try FileManager.default.createDirectory(at: cacheReport, withIntermediateDirectories: true)
+        cacheFailure.sessions = [HostSession(id: UUID(), entry: a, process: process, directory: cacheReport,
+            started: started, lifecycle: SessionLifecycle(name: a.name, startedAt: started))]
+        try write(["state": "ready", "classID": "cache-class", "name": "Cache Product",
+            "classes": ["Cache Product"], "classEntries": [["classID": "cache-class", "name": "Cache Product"]]],
+            to: cacheReport)
+        cacheFailure.poll()
+        try expect(cacheFailure.entries.first?.aliases.contains("Cache Product") == true && !cacheFailure.inventoryError.isEmpty,
+            "failed cache save preserves the in-memory catalog and reports failure")
+        try expect((try blockedCache.resourceValues(forKeys: [.isDirectoryKey])).isDirectory == true,
+            "failed cache save leaves the blocking destination intact")
+        try FileManager.default.removeItem(at: blockedCache)
+        try write(["state": "ready", "classID": "cache-class", "name": "Cache Product",
+            "classes": ["Cache Product", "Recovered Product"],
+            "classEntries": [["classID": "cache-class", "name": "Cache Product"],
+                             ["classID": "recovered-class", "name": "Recovered Product"]]], to: cacheReport)
+        cacheFailure.poll()
+        let restoredCache = try JSONDecoder().decode([Entry].self, from: Data(contentsOf: blockedCache))
+        try expect(cacheFailure.inventoryError.isEmpty && restoredCache == cacheFailure.entries,
+            "a successful later cache save clears the error and persists the current catalog")
         let sessionDirectory = support.appendingPathComponent("Sessions/" + UUID().uuidString)
         try FileManager.default.createDirectory(at: sessionDirectory, withIntermediateDirectories: true)
         let session = HostSession(id: UUID(), entry: a, process: process, directory: sessionDirectory,

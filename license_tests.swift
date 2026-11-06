@@ -6,6 +6,16 @@ import Darwin
 @main
 struct LicenseStateTests {
     static func main() throws {
+        if CommandLine.arguments.count == 3 {
+            do {
+                let store = try LicenseStore(directory: URL(fileURLWithPath: CommandLine.arguments[2]))
+                if CommandLine.arguments[1] == "--lock-probe" {
+                    try store.upsert(LicenseRecord(entryID: "fixture", metadataStamp: "fixture-stamp", classID: "class",
+                        productName: "Fixture", status: .activated, source: .user))
+                }
+                exit(1)
+            } catch { exit(0) }
+        }
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent("auth-license-tests-" + UUID().uuidString)
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
@@ -141,6 +151,28 @@ struct LicenseStateTests {
         check(failingStore.records == [first], "failed disk save does not publish a false confirmation in memory")
         check(try Data(contentsOf: recoveredDirectory.appendingPathComponent("license-state.json")) == savedBytes,
               "failed disk save leaves the previously committed bytes intact")
+        let fifoDirectory = root.appendingPathComponent("FIFO")
+        try fm.createDirectory(at: fifoDirectory, withIntermediateDirectories: true)
+        check(mkfifo(fifoDirectory.appendingPathComponent("license-state.json").path, mode_t(0o600)) == 0,
+              "create writerless ledger FIFO")
+        let fifoLockDirectory = root.appendingPathComponent("FIFOLock")
+        try fm.createDirectory(at: fifoLockDirectory, withIntermediateDirectories: true)
+        check(mkfifo(fifoLockDirectory.appendingPathComponent(".license-state.lock").path, mode_t(0o600)) == 0,
+              "create ledger lock FIFO")
+        for (mode, directory) in [("--read-probe", fifoDirectory), ("--lock-probe", fifoLockDirectory)] {
+            let probe = Process()
+            probe.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+            probe.arguments = [mode, directory.path]
+            try probe.run()
+            let deadline = Date().addingTimeInterval(2)
+            while probe.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
+            let blocked = probe.isRunning
+            if blocked { kill(probe.processIdentifier, SIGKILL) }
+            probe.waitUntilExit()
+            check(!blocked && probe.terminationStatus == 0, "non-regular ledger or lock is reported without blocking: " + mode)
+        }
+        check(!fm.fileExists(atPath: fifoLockDirectory.appendingPathComponent("license-state.json").path),
+              "rejected FIFO lock never creates a ledger")
         print("PASS: \(count) license state fixtures")
     }
 }

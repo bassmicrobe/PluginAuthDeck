@@ -168,20 +168,9 @@ final class LicenseStore {
     }
 
     private func readDisk() throws -> Data? {
-        let handle: FileHandle
-        do { handle = try FileHandle(forReadingFrom: fileURL) }
-        catch {
-            let ns = error as NSError
-            if (ns.domain == NSCocoaErrorDomain && (ns.code == NSFileReadNoSuchFileError || ns.code == NSFileNoSuchFileError))
-                || (ns.domain == NSPOSIXErrorDomain && ns.code == Int(ENOENT)) { return nil }
-            throw LicenseStoreError.unreadable(fileURL.path)
-        }
-        defer { try? handle.close() }
-        do {
-            let data = try handle.read(upToCount: Self.maximumBytes + 1) ?? Data()
-            guard data.count <= Self.maximumBytes else { throw LicenseStoreError.corrupt(fileURL.path) }
-            return data
-        } catch let error as LicenseStoreError { throw error }
+        do { return try LocalFileReader.read(fileURL.path, maximumBytes: Self.maximumBytes) }
+        catch LocalFileReadError.missing { return nil }
+        catch LocalFileReadError.tooLarge { throw LicenseStoreError.corrupt(fileURL.path) }
         catch { throw LicenseStoreError.unreadable(fileURL.path) }
     }
 
@@ -228,9 +217,13 @@ final class LicenseStore {
                                                     attributes: [.posixPermissions: 0o700])
         } catch { throw LicenseStoreError.cannotSave(fileURL.path) }
         let lockPath = directory.appendingPathComponent(".license-state.lock").path
-        let fd = Darwin.open(lockPath, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, mode_t(0o600))
+        let fd = Darwin.open(lockPath, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, mode_t(0o600))
         guard fd >= 0 else { throw LicenseStoreError.cannotSave(fileURL.path) }
         defer { Darwin.close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+            throw LicenseStoreError.cannotSave(fileURL.path)
+        }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { throw LicenseStoreError.busy }
         defer { _ = flock(fd, LOCK_UN) }
         return try body()

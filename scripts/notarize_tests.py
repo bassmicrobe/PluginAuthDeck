@@ -195,7 +195,7 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(state['stage'], 'prepared')
                 self.assertEqual(release.tree_digest(app), original_digest)
                 self.assertEqual(release.tree_digest(source), original_digest)
-                self.assertEqual(commands.calls, ['find-identity', 'copy-source', 'clear-staged-xattrs', 'sign-helper', 'sign-launcher'])
+                self.assertEqual(commands.calls, ['find-identity', 'copy-source', 'clear-staged-signing-metadata', 'sign-helper', 'sign-launcher'])
                 retained = attempt / state['failed_preparations'][0]
                 self.assertEqual((retained / leftover.relative_to(app)).read_bytes(), b'incomplete signature')
 

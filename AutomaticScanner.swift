@@ -80,6 +80,7 @@ final class AutomaticScanner: ObservableObject {
     private let directory: URL
     private let automaticallyTick: Bool
     private var workers: [Worker] = []
+    private var workspace: AutoScanWorkspace?
     private var timer: Timer?
     private var suspending = false
     private var shuttingDown = false
@@ -98,6 +99,7 @@ final class AutomaticScanner: ObservableObject {
     var inconclusiveCount: Int { results.filter { [.inconclusive, .timedOut, .loadFailed, .changed].contains($0.outcome) }.count }
     var isComplete: Bool { !runs.isEmpty && runs.allSatisfy { $0.status == .complete } && !hasActiveHosts }
     var reportURL: URL { directory.appendingPathComponent("自動チェック結果.csv") }
+    var checkpointDirectory: URL { workspace?.activeDirectory ?? directory }
 
     init(directory: URL, automaticallyTick: Bool = true) {
         self.directory = directory
@@ -116,9 +118,9 @@ final class AutomaticScanner: ObservableObject {
 
     private func loadStores() {
         do {
-            let loaded = try (0..<Self.workerCount).map {
-                Worker(store: try AutoScanStore(directory: directory.appendingPathComponent("worker-\($0)")))
-            }
+            let workspace = try AutoScanWorkspace(directory: directory)
+            let loaded = try workspace.stores(count: Self.workerCount).map(Worker.init)
+            self.workspace = workspace
             workers = loaded
             error = ""
             publish()
@@ -133,15 +135,23 @@ final class AutomaticScanner: ObservableObject {
     }
 
     func start(tasks: [AutoScanTask]) {
-        guard !isBusy, error.isEmpty, !tasks.isEmpty, workers.count == Self.workerCount else { return }
+        guard !isBusy, error.isEmpty, !tasks.isEmpty, workers.count == Self.workerCount,
+              let workspace = workspace else { return }
         shuttingDown = false
         suspending = false
         var seen = Set<String>()
         let unique = tasks.filter { seen.insert($0.id).inserted }
-        for (index, worker) in workers.enumerated() {
+        let runs = workers.indices.map { index in
             var run = AutoScanRun(tasks: unique.enumerated().filter { $0.offset % Self.workerCount == index }.map(\.element))
             run.resume()
-            guard commit(run, worker: worker) else { return }
+            return run
+        }
+        do {
+            workers = try workspace.replace(with: runs, previous: workers.map(\.store)).map(Worker.init)
+            publish()
+        } catch {
+            fail("自動チェックの記録を保存できません: " + error.localizedDescription)
+            return
         }
         message = "自動チェック中。認証画面への入力や操作は行いません。"
         beginTimer()
@@ -194,7 +204,8 @@ final class AutomaticScanner: ObservableObject {
 
     @discardableResult private func commit(_ run: AutoScanRun, worker: Worker) -> Bool {
         do {
-            try worker.store.save(run)
+            guard let workspace = workspace else { throw AutoScanError.invalidState }
+            try workspace.save(run, to: worker.store)
             worker.run = run
             publish()
             return true
@@ -335,7 +346,7 @@ final class AutomaticScanner: ObservableObject {
         return "\"" + safe.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
 
-    func writeReport() {
+    @discardableResult func writeReport() -> Bool {
         var lines = ["Product,Vendor,Format,Result,Reason,Path,ClassID"]
         for result in results.sorted(by: { $0.task.productName.localizedStandardCompare($1.task.productName) == .orderedAscending }) {
             let t = result.task
@@ -344,6 +355,10 @@ final class AutomaticScanner: ObservableObject {
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try ("\u{feff}" + lines.joined(separator: "\n") + "\n").write(to: reportURL, atomically: true, encoding: .utf8)
-        } catch { message = "チェック記録は保存済みですが、CSVを書き出せません: " + error.localizedDescription }
+            return true
+        } catch {
+            message = "チェック記録は保存済みですが、CSVを書き出せません: " + error.localizedDescription
+            return false
+        }
     }
 }

@@ -35,7 +35,8 @@ requires the host to remove the candidate without producing license evidence.
 It does not send UI clicks or write any production status.
 
 The runner copies only the generated fixture into a temporary directory under
-`results/fixture-staging`, removes attributes from that copy, signs it after
+`results/fixture-staging`, removes only FinderInfo and ResourceFork attributes
+from that copy while preserving quarantine and other attributes, signs it after
 module metadata generation, and verifies the signature. It launches the chosen
 AuthPluginHost with a temporary `--request`, its own Python parent PID, and scan
 mode. Only that retained child is stopped: `quit.request`, then bounded

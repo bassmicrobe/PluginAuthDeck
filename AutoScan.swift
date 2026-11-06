@@ -258,21 +258,21 @@ final class AutoScanStore {
         }
     }
 
-    private func readDisk() throws -> Data? {
-        let handle: FileHandle
-        do { handle = try FileHandle(forReadingFrom: fileURL) }
-        catch {
-            let ns = error as NSError
-            if (ns.domain == NSCocoaErrorDomain && (ns.code == NSFileNoSuchFileError || ns.code == NSFileReadNoSuchFileError))
-                || (ns.domain == NSPOSIXErrorDomain && ns.code == Int(ENOENT)) { return nil }
-            throw AutoScanError.unreadable(fileURL.path)
+    fileprivate func withUnchangedSnapshot<T>(_ operation: () throws -> T) throws -> T {
+        lock.lock(); defer { lock.unlock() }
+        return try withDiskLock {
+            let existing = try readDisk()
+            _ = try decode(existing)
+            guard existing == diskSnapshot else { throw AutoScanError.changedOnDisk }
+            return try operation()
         }
-        defer { try? handle.close() }
+    }
+
+    private func readDisk() throws -> Data? {
         do {
-            let data = try handle.read(upToCount: Self.maximumBytes + 1) ?? Data()
-            guard data.count <= Self.maximumBytes else { throw AutoScanError.corrupt(fileURL.path) }
-            return data
-        } catch let error as AutoScanError { throw error }
+            return try LocalFileReader.read(fileURL.path, maximumBytes: Self.maximumBytes)
+        } catch LocalFileReadError.missing { return nil }
+        catch LocalFileReadError.tooLarge { throw AutoScanError.corrupt(fileURL.path) }
         catch { throw AutoScanError.unreadable(fileURL.path) }
     }
 
@@ -296,11 +296,135 @@ final class AutoScanStore {
                                                     attributes: [.posixPermissions: 0o700])
         } catch { throw AutoScanError.cannotSave(fileURL.path) }
         let fd = Darwin.open(directory.appendingPathComponent(".autoscan-state.lock").path,
-                             O_CREAT | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, mode_t(0o600))
+                             O_CREAT | O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, mode_t(0o600))
         guard fd >= 0 else { throw AutoScanError.cannotSave(fileURL.path) }
         defer { Darwin.close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+            throw AutoScanError.cannotSave(fileURL.path)
+        }
         guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { throw AutoScanError.busy }
         defer { _ = flock(fd, LOCK_UN) }
         return try body()
+    }
+}
+
+/// A scan starts as a complete set of independent worker checkpoints. Publish
+/// their directory only after every checkpoint is durable; a failed new scan
+/// must not replace half of the previous scan's results.
+final class AutoScanWorkspace {
+    private struct Manifest: Codable {
+        let version: Int
+        let directory: String
+    }
+
+    private let directory: URL
+    private let manifestURL: URL
+    private var diskSnapshot: Data?
+    private(set) var activeDirectory: URL
+
+    init(directory: URL) throws {
+        self.directory = directory
+        manifestURL = directory.appendingPathComponent("current-run.json")
+        activeDirectory = directory
+        diskSnapshot = try readManifest()
+        if let data = diskSnapshot {
+            let manifest: Manifest
+            do { manifest = try JSONDecoder().decode(Manifest.self, from: data) }
+            catch { throw AutoScanError.corrupt(manifestURL.path) }
+            guard manifest.version == 1 else { throw AutoScanError.unsupportedVersion(manifest.version) }
+            guard UUID(uuidString: manifest.directory) != nil else { throw AutoScanError.corrupt(manifestURL.path) }
+            activeDirectory = directory.appendingPathComponent("runs", isDirectory: true)
+                .appendingPathComponent(manifest.directory, isDirectory: true)
+        }
+    }
+
+    func stores(count: Int) throws -> [AutoScanStore] {
+        let stores = try (0..<count).map {
+            try AutoScanStore(directory: activeDirectory.appendingPathComponent("worker-\($0)"))
+        }
+        guard diskSnapshot == nil || stores.allSatisfy({ $0.run != nil }) else {
+            throw AutoScanError.corrupt(manifestURL.path)
+        }
+        return stores
+    }
+
+    func save(_ run: AutoScanRun, to store: AutoScanStore) throws {
+        try withManifestLock {
+            try ensureCurrent()
+            try store.save(run)
+        }
+    }
+
+    func replace(with runs: [AutoScanRun], previous: [AutoScanStore]) throws -> [AutoScanStore] {
+        guard !runs.isEmpty, runs.count == previous.count else { throw AutoScanError.invalidState }
+        try runs.forEach { try $0.validate() }
+        return try withManifestLock {
+            try ensureCurrent()
+            return try withSnapshots(previous[...]) { try publish(runs) }
+        }
+    }
+
+    private func publish(_ runs: [AutoScanRun]) throws -> [AutoScanStore] {
+        let name = UUID().uuidString
+        let parent = directory.appendingPathComponent("runs", isDirectory: true)
+        let next = parent.appendingPathComponent(name, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            try FileManager.default.createDirectory(at: next, withIntermediateDirectories: false,
+                                                    attributes: [.posixPermissions: 0o700])
+        } catch { throw AutoScanError.cannotSave(manifestURL.path) }
+        do {
+            let stores = try runs.enumerated().map { index, run in
+                let store = try AutoScanStore(directory: next.appendingPathComponent("worker-\(index)"))
+                try store.save(run)
+                return store
+            }
+            let data = try JSONEncoder().encode(Manifest(version: 1, directory: name))
+            try data.write(to: manifestURL, options: .atomic)
+            diskSnapshot = data
+            activeDirectory = next
+            return stores
+        } catch {
+            // Only remove the unpublished directory created above.
+            // Old generations remain available for manual recovery.
+            do { try FileManager.default.removeItem(at: next) }
+            catch { throw AutoScanError.cannotSave(next.path + "（未公開の作業記録を削除できません）") }
+            throw error
+        }
+    }
+
+    private func withSnapshots<T>(_ stores: ArraySlice<AutoScanStore>, _ operation: () throws -> T) throws -> T {
+        guard let first = stores.first else { return try operation() }
+        return try first.withUnchangedSnapshot { try withSnapshots(stores.dropFirst(), operation) }
+    }
+
+    private func readManifest() throws -> Data? {
+        do { return try LocalFileReader.read(manifestURL.path, maximumBytes: 1024) }
+        catch LocalFileReadError.missing { return nil }
+        catch { throw AutoScanError.corrupt(manifestURL.path) }
+    }
+
+    private func ensureCurrent() throws {
+        guard try readManifest() == diskSnapshot else { throw AutoScanError.changedOnDisk }
+    }
+
+    private func withManifestLock<T>(_ operation: () throws -> T) throws -> T {
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+        } catch { throw AutoScanError.cannotSave(manifestURL.path) }
+        let fd = Darwin.open(directory.appendingPathComponent(".autoscan-run.lock").path,
+                             O_CREAT | O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, mode_t(0o600))
+        guard fd >= 0 else { throw AutoScanError.cannotSave(manifestURL.path) }
+        defer { Darwin.close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+            throw AutoScanError.cannotSave(manifestURL.path)
+        }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { throw AutoScanError.busy }
+        defer { _ = flock(fd, LOCK_UN) }
+        return try operation()
     }
 }

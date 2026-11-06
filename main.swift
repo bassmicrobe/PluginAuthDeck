@@ -62,6 +62,7 @@ struct HostSession: Identifiable {
 }
 
 final class DeskModel: ObservableObject {
+    private static let maximumInventoryCacheBytes = 16 * 1024 * 1024
     @Published var entries: [Entry] = []
     @Published var managers = Inventory.managers()
     @Published var selection: String?
@@ -77,6 +78,7 @@ final class DeskModel: ObservableObject {
     @Published var scanSeconds = 0.0
     @Published var licenseRecords: [LicenseRecord] = []
     @Published var licenseError = ""
+    @Published var inventoryError = ""
     @Published var unconfirmedOnly = false
     @Published var workflow: ActivationWorkflow?
     private let supportDirectory: URL
@@ -117,8 +119,13 @@ final class DeskModel: ObservableObject {
         try? FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true,
                                                   attributes: [.posixPermissions: 0o700])
         let cache = supportDirectory.appendingPathComponent("inventory.json")
-        if let d = try? Data(contentsOf: cache), let c = try? JSONDecoder().decode([Entry].self, from: d) {
-            entries = c
+        do {
+            let data = try LocalFileReader.read(cache.path, maximumBytes: Self.maximumInventoryCacheBytes)
+            entries = try JSONDecoder().decode([Entry].self, from: data)
+        } catch LocalFileReadError.missing {
+            // A first launch has no cache; the inventory refresh creates it.
+        } catch {
+            inventoryError = "一覧キャッシュを読み込めません。「一覧を更新」で再取得してください。認証記録は変更していません。"
         }
         if let initialEntries = initialEntries { entries = initialEntries }
         searchDocuments = Self.searchIndex(entries + managers)
@@ -322,9 +329,7 @@ final class DeskModel: ObservableObject {
         if zip(sessions, updated).contains(where: { $0.lifecycle != $1.lifecycle || $0.knownClasses != $1.knownClasses || $0.classID != $1.classID || $0.evidenceObservedAt != $1.evidenceObservedAt || $0.products != $1.products || $0.readyAt != $1.readyAt || $0.candidate != $1.candidate }) {
             sessions = updated
         }
-        if catalogChanged, let data = try? JSONEncoder().encode(entries) {
-            try? data.write(to: self.supportDirectory.appendingPathComponent("inventory.json"), options: .atomic)
-        }
+        if catalogChanged { saveInventoryCache() }
     }
 
     private func receiveHostMetadata(_ report: [String: Any], session: inout HostSession) -> Bool {
@@ -393,8 +398,13 @@ final class DeskModel: ObservableObject {
     }
 
     private func saveInventoryCache() {
-        if let data = try? JSONEncoder().encode(entries) {
-            try? data.write(to: self.supportDirectory.appendingPathComponent("inventory.json"), options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(entries)
+            guard data.count <= Self.maximumInventoryCacheBytes else { throw LocalFileReadError.tooLarge }
+            try data.write(to: supportDirectory.appendingPathComponent("inventory.json"), options: .atomic)
+            inventoryError = ""
+        } catch {
+            inventoryError = "一覧キャッシュを保存できません。表示中の一覧は利用できますが、次回起動時は再取得が必要です。"
         }
     }
 
@@ -629,6 +639,7 @@ struct DeskView: View {
                         if !model.query.isEmpty {
                             Button { model.query = "" } label: { Image(systemName: "xmark.circle.fill") }
                                 .buttonStyle(.plain).foregroundColor(.secondary).help("検索を消去")
+                                .accessibilityLabel("検索を消去")
                         }
                     }.padding(9).background(Color(nsColor: .textBackgroundColor)).cornerRadius(8)
                     HStack {
@@ -640,6 +651,7 @@ struct DeskView: View {
                         Spacer()
                         Toggle(isOn: $model.favoritesOnly) { Image(systemName: "star.fill").foregroundColor(.yellow) }
                             .toggleStyle(.checkbox).help("お気に入りだけ表示")
+                            .accessibilityLabel("お気に入りだけ表示")
                     }
                     if model.category == "未認証" {
                         Text("未認証の表示を検出した製品と、手動で未認証にした製品だけを表示します。")
@@ -701,6 +713,10 @@ struct DeskView: View {
                         if !model.licenseError.isEmpty {
                             Label(model.licenseError, systemImage: "exclamationmark.triangle").foregroundColor(.red).textSelection(.enabled)
                             Button("記録を再読み込み", action: model.reloadLicenseState)
+                        }
+                        if !model.inventoryError.isEmpty {
+                            Label(model.inventoryError, systemImage: "exclamationmark.triangle")
+                                .foregroundColor(.orange).textSelection(.enabled)
                         }
                         if let entry = model.selected {
                             detail(entry)
@@ -854,6 +870,8 @@ struct DeskView: View {
                 Button { model.toggleFavorite(e) } label: {
                     Image(systemName: model.favorites.contains(e.id) ? "star.fill" : "star").font(.system(size: 18))
                 }.buttonStyle(.plain).foregroundColor(model.favorites.contains(e.id) ? .yellow : .secondary).help("お気に入り")
+                    .accessibilityLabel(model.favorites.contains(e.id) ? "お気に入りから削除" : "お気に入りに追加")
+                    .accessibilityValue(model.favorites.contains(e.id) ? "登録済み" : "未登録")
             }
             HStack(spacing: 9) {
                 Text(e.format).fontWeight(.semibold)
@@ -931,7 +949,9 @@ struct AutomaticScanPanel: View {
                         .disabled(!mayStart || !scanner.error.isEmpty)
                 }
                 if !scanner.results.isEmpty {
-                    Button("結果CSV") { scanner.writeReport(); NSWorkspace.shared.open(scanner.reportURL) }
+                    Button("結果CSV") {
+                        if scanner.writeReport() { NSWorkspace.shared.open(scanner.reportURL) }
+                    }
                 }
             }
             if scanner.totalCount > 0 {
@@ -994,8 +1014,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc func about() {
         let alert = NSAlert()
-        alert.messageText = "Plugin Auth Desk 1.3"
-        alert.informativeText = "このMac向けのプラグイン認証ランチャー。\nVST3 / AU • Apple Silicon / Intel\n\nホスト: JUCE 9.0.2 (AGPLv3)\nソース・ライセンスはアプリ内のResourcesに同梱しています。"
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "バージョン不明"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        alert.messageText = "Plugin Auth Desk " + version + (build.map { " (build \($0))" } ?? "")
+        alert.informativeText = "このMac向けのプラグイン認証ランチャー。\nVST3 / AU\nランチャー: Apple Silicon\nプラグインホスト: Apple Silicon / Intel\n\nホスト: JUCE 9.0.2 (AGPLv3)\nソース・ライセンスはアプリ内のResourcesに同梱しています。"
         alert.runModal()
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
