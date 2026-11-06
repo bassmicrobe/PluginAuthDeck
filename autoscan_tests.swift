@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Compile: swiftc Inventory.swift AutoScan.swift autoscan_tests.swift -o /tmp/auth-autoscan-tests
+import Foundation
+import Darwin
+
+@main
+struct AutoScanTests {
+    static func main() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("auth-autoscan-tests-" + UUID().uuidString)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+        var count = 0
+        func check(_ condition: Bool, _ message: String) {
+            count += 1
+            guard condition else { fatalError("FAIL: " + message) }
+        }
+        func expectError(_ message: String, _ operation: () throws -> Void) {
+            count += 1
+            do { try operation(); fatalError("FAIL: expected error: " + message) }
+            catch { }
+        }
+        func entry(_ name: String, format: String = "VST3", stamp: String = "version-1") -> Entry {
+            let path = root.appendingPathComponent(name + "." + format).path
+            return Entry(id: path, name: name, vendor: "Acme", format: format, path: path,
+                identifier: path, version: "1", architectures: ["arm64"], metadataStamp: stamp)
+        }
+        let bundle = entry("Bundle")
+        let other = entry("Other")
+        let initial = AutoScanTask(entry: bundle)
+        let secondModule = AutoScanTask(entry: other)
+        let classOne = AutoScanTask(entry: bundle, classID: "one", productName: "Product One")
+        let classTwo = AutoScanTask(entry: bundle, classID: "two", productName: "Product Two")
+        let changedClass = AutoScanTask(entry: entry("Bundle", stamp: "version-2"), classID: "one", productName: "Product One")
+        check(classOne.id != changedClass.id, "different binary versions have distinct scan identities")
+        check(classOne.id != classTwo.id, "bundled products retain separate identities")
+
+        var run = AutoScanRun(tasks: [initial, initial, secondModule])
+        check(run.status == .paused && run.pending.count == 2, "new run is paused and removes exact duplicate tasks")
+        check(run.totalCount == 2 && run.completedCount == 0, "initial counts cover pending tasks only")
+        check(run.beginNext() == nil, "a paused queue cannot open anything")
+        run.resume()
+        check(run.beginNext() == initial, "explicit resume allows the first task")
+        check(run.beginNext() == nil && run.current == initial, "there is at most one in-flight task")
+        let beforeInvalid = run
+        expectError("a sibling from another version is rejected") {
+            try run.identifyCurrent(classID: "one", productName: "Product One", siblings: [changedClass])
+        }
+        check(run == beforeInvalid, "failed class discovery leaves the queue unchanged")
+        try run.identifyCurrent(classID: "one", productName: "Product One", siblings: [classOne, classTwo, classTwo])
+        check(run.current == classOne && run.pending.map(\.id) == [secondModule.id, classTwo.id],
+              "initial placeholder is replaced and unseen siblings are queued exactly once")
+        check(run.totalCount == 3, "discovering sibling classes expands total count")
+        let identified = run
+        expectError("the requested explicit class cannot silently change") {
+            try run.identifyCurrent(classID: "two", productName: "Product Two")
+        }
+        check(run == identified, "wrong-class rejection is transactional")
+        try run.finishCurrent(outcome: .needsActivation, reason: "explicit-activation-label", checkedAt: Date(timeIntervalSince1970: 10.25))
+        check(run.completedCount == 1 && run.current == nil && run.status == .running,
+              "finished result is separate from pending work")
+        check(run.results[0].task == classOne && run.results[0].checkedAt == Date(timeIntervalSince1970: 10.25),
+              "result records exact source, class and observation time")
+        expectError("a result cannot be completed twice") { try run.finishCurrent(outcome: .inconclusive, reason: "duplicate") }
+
+        _ = run.beginNext()
+        run.pause()
+        check(run.status == .paused && run.current == nil && run.pending.first == secondModule,
+              "pause requeues only the interrupted target at the front")
+        check(run.completedCount == 1, "pause preserves completed results")
+        run.resume(); _ = run.beginNext()
+        try run.finishCurrent(outcome: .loadFailed, reason: "host-load-failed")
+        check(run.results.last?.task.classID == "" && run.results.last?.outcome == .loadFailed,
+              "failure before class discovery remains a module load result")
+        check(run.beginNext() == classTwo, "resume does not repeat the completed first class")
+        try run.identifyCurrent(classID: "two", productName: "Product Two", siblings: [classOne, classTwo])
+        check(run.pending.isEmpty, "rediscovery never requeues completed or in-flight classes")
+        try run.finishCurrent(outcome: .inconclusive, reason: "no-explicit-signal")
+        check(run.status == .complete && run.completedCount == 3 && run.totalCount == 3,
+              "last task completes the run")
+        run.resume(); check(run.status == .complete && run.beginNext() == nil, "completed runs do not restart automatically")
+        check(!AutoScanOutcome.allCases.map(\.rawValue).contains("activated"), "absence of a warning is never represented as activated")
+
+        var auOne = entry("Shared AU", format: "AU")
+        auOne.id += "|aumu,one,Acme"
+        var auTwo = auOne
+        auTwo.id = auOne.path + "|aumu,two,Acme"
+        auTwo.identifier = "AudioUnit:Synths/aumu,two,Acme"
+        let auQueue = AutoScanRun(tasks: [AutoScanTask(entry: auOne), AutoScanTask(entry: auTwo)])
+        check(auQueue.totalCount == 2, "AU components sharing one file are not collapsed by path")
+
+        // If a discovery placeholder and an already-known sibling were queued,
+        // resolving the placeholder to that sibling must remove the duplicate.
+        var placeholder = AutoScanRun(tasks: [initial, classOne, classTwo])
+        placeholder.resume(); _ = placeholder.beginNext()
+        try placeholder.identifyCurrent(classID: "one", productName: "Product One", siblings: [classOne, classTwo])
+        check(placeholder.totalCount == 2 && placeholder.pending == [classTwo], "class resolution absorbs an equivalent pending task")
+
+        let store = try AutoScanStore(directory: root.appendingPathComponent("Store"))
+        check(store.run == nil && !fm.fileExists(atPath: store.fileURL.path), "no checkpoint means no implicit run")
+        try store.save(run)
+        let completedReload = try AutoScanStore(directory: root.appendingPathComponent("Store"))
+        check(completedReload.run?.status == .complete && completedReload.run?.results == run.results,
+              "a completed checkpoint remains complete after reload")
+
+        var interrupted = AutoScanRun(tasks: [initial, secondModule])
+        interrupted.resume(); _ = interrupted.beginNext()
+        try interrupted.identifyCurrent(classID: "one", productName: "Product One", siblings: [classTwo])
+        try interrupted.finishCurrent(outcome: .needsActivation, reason: "explicit-activation-label")
+        _ = interrupted.beginNext()
+        try store.save(interrupted)
+        let originalBytes = try Data(contentsOf: store.fileURL)
+        let restored = try AutoScanStore(directory: root.appendingPathComponent("Store"))
+        var recovered = restored.run!
+        check(recovered.status == .paused && recovered.current == nil, "interrupted run is recovered paused")
+        check(recovered.pending.map(\.id) == [secondModule.id, classTwo.id], "only the unfinished target is returned to the front")
+        check(recovered.results == interrupted.results, "recovery preserves completed classes and outcomes")
+        check(try Data(contentsOf: restored.fileURL) == originalBytes, "recovery itself performs no disk mutation")
+        check(recovered.beginNext() == nil, "recovery never resumes a process by itself")
+        try restored.save(recovered)
+        check(restored.run == recovered, "recovered checkpoint saves against original disk snapshot successfully")
+        recovered.resume(); check(recovered.beginNext() == secondModule, "explicit resume picks the interrupted target")
+        try recovered.finishCurrent(outcome: .timedOut, reason: "host-timeout")
+        _ = recovered.beginNext()
+        try recovered.finishCurrent(outcome: .changed, reason: "binary-stamp-changed")
+        try restored.save(recovered)
+        check(restored.run?.status == .complete, "timeout and changed source both allow the durable queue to finish")
+
+        expectError("another writer cannot overwrite a newer checkpoint") { try store.save(run) }
+        try store.reload()
+        check(store.run?.results == recovered.results, "explicit reload adopts a valid newer checkpoint")
+
+        let beforeCorruption = restored.run
+        let bad = Data("{bad checkpoint".utf8)
+        try bad.write(to: restored.fileURL, options: .atomic)
+        expectError("corrupt checkpoint is not reset on load") { _ = try AutoScanStore(directory: root.appendingPathComponent("Store")) }
+        expectError("running store refuses to overwrite corruption") { try restored.save(run) }
+        expectError("reload reports corruption") { try restored.reload() }
+        let bytesAfterFailedSave = try Data(contentsOf: restored.fileURL)
+        check(restored.run == beforeCorruption && bytesAfterFailedSave == bad,
+              "failed save and reload preserve memory and original corrupted bytes")
+
+        // Invalid state documents are rejected even when their JSON is valid.
+        let invalidDirectory = root.appendingPathComponent("Invalid")
+        try fm.createDirectory(at: invalidDirectory, withIntermediateDirectories: true)
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .secondsSince1970
+        var invalidRun = try JSONSerialization.jsonObject(with: encoder.encode(run)) as! [String: Any]
+        invalidRun["pending"] = [try JSONSerialization.jsonObject(with: encoder.encode(initial))]
+        let invalid = try JSONSerialization.data(withJSONObject: ["version": 1, "run": invalidRun])
+        try invalid.write(to: invalidDirectory.appendingPathComponent("autoscan-state.json"))
+        expectError("complete run with pending tasks is invalid") { _ = try AutoScanStore(directory: invalidDirectory) }
+        invalidRun = try JSONSerialization.jsonObject(with: encoder.encode(run)) as! [String: Any]
+        let future = try JSONSerialization.data(withJSONObject: ["version": 2, "run": invalidRun])
+        try future.write(to: invalidDirectory.appendingPathComponent("autoscan-state.json"))
+        expectError("newer checkpoint schemas are not overwritten") { _ = try AutoScanStore(directory: invalidDirectory) }
+
+        let blockedDirectory = root.appendingPathComponent("Blocked")
+        let blockedStore = try AutoScanStore(directory: blockedDirectory)
+        try blockedStore.save(run)
+        let blockedSnapshot = blockedStore.run
+        let lockedFD = Darwin.open(blockedDirectory.appendingPathComponent(".autoscan-state.lock").path, O_CREAT | O_WRONLY, mode_t(0o600))
+        check(lockedFD >= 0 && flock(lockedFD, LOCK_EX | LOCK_NB) == 0, "test holds the checkpoint lock")
+        expectError("checkpoint lock contention does not block indefinitely") { try blockedStore.save(interrupted) }
+        check(blockedStore.run == blockedSnapshot, "lock contention leaves saved memory unchanged")
+        _ = flock(lockedFD, LOCK_UN); Darwin.close(lockedFD)
+        try blockedStore.save(interrupted)
+        check(blockedStore.run == interrupted, "save can retry after lock release")
+
+        let backup = root.appendingPathComponent("Blocked-original")
+        try fm.moveItem(at: blockedDirectory, to: backup)
+        try Data("directory replaced with a file for the test".utf8).write(to: blockedDirectory)
+        expectError("disk write failure is surfaced") { try blockedStore.save(run) }
+        check(blockedStore.run == interrupted, "disk write failure cannot advance the in-memory queue")
+        check(fm.fileExists(atPath: backup.appendingPathComponent("autoscan-state.json").path), "last committed checkpoint remains recoverable")
+        print("PASS: \(count) automatic scan state fixtures")
+    }
+}

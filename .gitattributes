@@ -1,0 +1,11 @@
+* text=auto eol=lf
+*.swift text
+*.cpp text
+*.h text
+*.mm text
+*.py text
+*.md text
+*.png binary
+*.icns binary
+*.zip binary
+*.gz binary

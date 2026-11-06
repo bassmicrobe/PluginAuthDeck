@@ -1,0 +1,69 @@
+# Generated build products, dependency caches and local test output.
+build/
+dist/
+deps/
+results/
+outputs/
+runtime/
+generated/
+*.app/
+*.vst3/
+*.component/
+*.aaxplugin/
+*.iconset/
+*.icns
+/PluginAuthDesk
+*.o
+*.a
+*.dylib
+*.dSYM/
+*.log
+*.sample.txt
+*-sample.txt
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Never commit real plug-in inventory, sessions, license state, or reports.
+Sessions/
+Automatic Scan/
+Backups/
+Legacy Recheck Backups/
+inventory.json
+class-catalog.json
+license-state.json
+autoscan-state.json
+request.json
+status.json
+heartbeat.json
+quit.request
+*.jsonl
+*.csv
+*-verification.json
+
+# Local secrets and signing/notarization inputs.
+.local/
+notary-results/
+notarization-results/
+notary-*.json
+notarization-*.json
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.mobileprovision
+*.provisionprofile
+*.keychain
+*.keychain-db
+*.notary.json
+
+# Archives belong in release assets, not source history.
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.dmg
+*.whl
