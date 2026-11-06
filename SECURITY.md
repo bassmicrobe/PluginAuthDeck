@@ -18,7 +18,7 @@ Plugin Auth Deskはライセンスキーやパスワードを収集・保存・�
 
 ## ビルドと配布
 
-通常の`build.py`はad-hoc署名を使用します。これは配布者の身元を証明するDeveloper ID署名ではなく、そのビルドだけでApple公証が完了することもありません。ソースのバージョンは1.3.2（build 6）です。
+通常の`build.py`はad-hoc署名を使用します。これは配布者の身元を証明するDeveloper ID署名ではなく、そのビルドだけでApple公証が完了することもありません。ソースのバージョンは1.3.3（build 7）です。
 
 独立した配布用スクリプト`scripts/notarize.py`は、別の作業コピーをDeveloper ID・Hardened Runtime付きで署名し、Appleへの申請、Accepted後のstaple、ZIP展開後の検証を行えます。手順は[NOTARIZATION.md](docs/NOTARIZATION.md)を参照してください。ソースや手順が存在することは、特定の配布物が公証済みである証拠ではありません。
 

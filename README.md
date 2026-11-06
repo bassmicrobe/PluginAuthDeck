@@ -2,7 +2,7 @@
 
 DAWを起動せずに、MacへインストールしたAU / VST3プラグインの認証画面を開くランチャーです。明示的な未認証表示を検出した製品を一覧にまとめ、メーカーの画面で1件ずつ認証できます。
 
-ソースのバージョンは **1.3.2（build 6）** です。通常の`build.py`はad-hoc署名の開発用アプリを作ります。Developer ID署名とApple公証を行う独立した配布処理は、[公証手順](docs/NOTARIZATION.md)を参照してください。
+ソースのバージョンは **1.3.3（build 7）** です。配布版は[GitHub Releases](https://github.com/bassmicrobe/PluginAuthDeck/releases)から取得できます。通常の`build.py`はad-hoc署名の開発用アプリを作ります。Developer ID署名とApple公証を行う独立した配布処理は、[公証手順](docs/NOTARIZATION.md)を参照してください。
 
 ## できること
 
