@@ -28,7 +28,7 @@ python3 scripts/notarize.py \
 
 既定では`results/notarization/run-.../`を新規作成し、元の`dist`アプリをコピーします。元アプリと`~/Applications`の既存アプリは変更せず、アプリやプラグインも起動しません。必要なら`--source-app`と`--output-root`で入出力先を指定できます。
 
-ホストを先にDeveloper ID・Hardened Runtime・安全なタイムスタンプ付きで署名します。ホストに許可する例外は、異なる提供元のプラグインを読み込むための`com.apple.security.cs.disable-library-validation`だけです。ランチャーに例外は付けません。その後、厳密な署名検証、各アーキテクチャ、署名証明書、Team ID、runtime、タイムスタンプ、entitlementsを確認します。
+ホストを先にDeveloper ID・Hardened Runtime・安全なタイムスタンプ付きで署名します。ホストに許可する例外は、異なる提供元のプラグインを読み込むための`com.apple.security.cs.disable-library-validation`と、実行時にコードを生成・変更する製品のための`com.apple.security.cs.allow-unsigned-executable-memory`です。Auto-Tune Proの実行時署名エラーを再現し、後者を加えると読み込めることを確認しています。ランチャーに例外は付けません。その後、厳密な署名検証、各アーキテクチャ、署名証明書、Team ID、runtime、タイムスタンプ、entitlementsを確認します。
 
 作業コピーでは署名を妨げる`com.apple.FinderInfo`と`com.apple.ResourceFork`だけを削除します。隔離属性（quarantine）や由来情報（provenance）は保持し、Gatekeeperの設定を変更しません。
 

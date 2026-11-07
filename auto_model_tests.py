@@ -110,7 +110,7 @@ final class Hosts {
     static func run() throws {
         let root = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
         if let mode = CommandLine.arguments.dropFirst(2).first, mode.hasPrefix("--nonregular-") {
-            let scanner = AutomaticScanner(directory: root, automaticallyTick: false)
+            let scanner = AutomaticScanner(directory: root, automaticallyTick: false, automaticallyRetryFailures: false)
             if mode.hasSuffix("-lock") {
                 scanner.start(tasks: [AutoScanTask(entry: try entry(root, 999))])
             }
@@ -126,7 +126,7 @@ final class Hosts {
         // Ready -> observation window -> stop request -> confirmed exit. An
         // exit is the only event that releases a worker slot.
         let directory = root.appendingPathComponent("sequential")
-        let scanner = AutomaticScanner(directory: directory, automaticallyTick: false)
+        let scanner = AutomaticScanner(directory: directory, automaticallyTick: false, automaticallyRetryFailures: false)
         let hosts = Hosts(directory: directory, base: base)
         hosts.attach(scanner)
         scanner.start(tasks: Array(tasks.prefix(4)))
@@ -134,10 +134,10 @@ final class Hosts {
         try expect(hosts.checkpointFailures == 0, "checkpoint saved before every launch")
         let first = hosts.launchOrder
         first.forEach { hosts.ready($0) }
-        scanner.tick(now: base.addingTimeInterval(3.9))
-        try expect(hosts.stops.isEmpty, "ready observation does not end before four seconds")
-        scanner.tick(now: base.addingTimeInterval(4))
-        try expect(Set(hosts.stops) == Set(first) && scanner.completedCount == 0, "four seconds requests stop without declaring completion")
+        scanner.tick(now: base.addingTimeInterval(5.9))
+        try expect(hosts.stops.isEmpty, "ready observation does not end before six seconds")
+        scanner.tick(now: base.addingTimeInterval(6))
+        try expect(Set(hosts.stops) == Set(first) && scanner.completedCount == 0, "six seconds requests stop without declaring completion")
         scanner.tick(now: base.addingTimeInterval(100))
         try expect(hosts.launchOrder.count == 2 && hosts.stops.count == 2, "unresponsive teardown neither relaunches nor repeats stop")
         hosts.close(first[0])
@@ -162,7 +162,7 @@ final class Hosts {
         try expect(scanner.runs.allSatisfy { $0.status == .paused && $0.current == nil }, "paused checkpoint contains no live ownership")
         scanner.shutdown()
 
-        let restored = AutomaticScanner(directory: directory, automaticallyTick: false)
+        let restored = AutomaticScanner(directory: directory, automaticallyTick: false, automaticallyRetryFailures: false)
         let restoredHosts = Hosts(directory: directory, base: base)
         restoredHosts.attach(restored)
         try expect(restored.canResume && restoredHosts.attempts == 0 && restored.completedCount == 2,
@@ -183,13 +183,37 @@ final class Hosts {
         try expect(restored.results.contains { $0.outcome == .loadFailed }, "load failure stays distinct from licensing")
         try expect(FileManager.default.fileExists(atPath: restored.reportURL.path), "completion writes report in injected directory")
 
+        // These state-machine cases disable the separately tested retry policy.
+        // A worker's previous stop reason must never leak into the next task.
+        let reasonDir = root.appendingPathComponent("reason-reset")
+        let reasonScan = AutomaticScanner(directory: reasonDir, automaticallyTick: false, automaticallyRetryFailures: false)
+        let reasonHosts = Hosts(directory: reasonDir, base: base)
+        reasonHosts.attach(reasonScan)
+        reasonScan.start(tasks: Array(tasks.prefix(3)))
+        reasonHosts.launchOrder.forEach { reasonHosts.ready($0) }
+        reasonScan.tick(now: base.addingTimeInterval(6))
+        reasonHosts.launchOrder.forEach { reasonHosts.close($0) }
+        reasonScan.tick(now: base.addingTimeInterval(7))
+        reasonScan.tick(now: base.addingTimeInterval(8))
+        let failedAfterUnknown = reasonHosts.launchOrder.last!
+        reasonHosts.observations[failedAfterUnknown]?.failureReason = "instance_creation_failed"
+        reasonHosts.close(failedAfterUnknown, state: "error")
+        reasonScan.tick(now: base.addingTimeInterval(9))
+        try expect(reasonScan.isComplete && reasonScan.results.last(where: { $0.outcome == .loadFailed })?.reason == "instance_creation_failed",
+            "a new task's immediate exit keeps its own failure reason instead of the previous inconclusive reason")
+        try expect(reasonScan.unactivatedCount == 0, "diagnostic reason never creates an activation verdict")
+
         // Absolute startup deadline applies even without ready and even when
         // the host keeps presenting a modal/license dialog.
         let timeoutDir = root.appendingPathComponent("timeout")
-        let timed = AutomaticScanner(directory: timeoutDir, automaticallyTick: false)
+        let timed = AutomaticScanner(directory: timeoutDir, automaticallyTick: false, automaticallyRetryFailures: false)
         let timedHosts = Hosts(directory: timeoutDir, base: base)
         timedHosts.attach(timed)
         timed.start(tasks: Array(tasks.prefix(2)))
+        timedHosts.observations[timedHosts.launchOrder[0]]?.phase = "creating_instance"
+        timedHosts.observations[timedHosts.launchOrder[0]]?.heartbeatAt = base.addingTimeInterval(24.9)
+        timedHosts.observations[timedHosts.launchOrder[1]]?.phase = "enumerating"
+        timedHosts.observations[timedHosts.launchOrder[1]]?.heartbeatAt = base
         timed.tick(now: base.addingTimeInterval(24.9))
         try expect(timedHosts.stops.isEmpty, "startup allowed before deadline")
         timed.tick(now: base.addingTimeInterval(25))
@@ -197,10 +221,210 @@ final class Hosts {
         timedHosts.launchOrder.forEach { timedHosts.close($0) }
         timed.tick(now: base.addingTimeInterval(26))
         try expect(timed.isComplete && timed.results.allSatisfy { $0.outcome == .timedOut }, "timeout results require real exit")
+        try expect(Set(timed.results.map(\.reason)) == Set(["creating_instance_deadline_responsive", "enumerating_heartbeat_stalled"]),
+            "responsive slow loading and a stalled message thread retain distinct phase-specific timeout reasons")
+
+        // A cold Vision engine can time out even with a responsive editor.
+        // Only its explicit latest timeout joins the one-pass serial retry.
+        let ocrDir = root.appendingPathComponent("ocr-timeout-retry")
+        let ocr = AutomaticScanner(directory: ocrDir, automaticallyTick: false)
+        let ocrHosts = Hosts(directory: ocrDir, base: base)
+        ocrHosts.attach(ocr)
+        ocr.start(tasks: Array(tasks.prefix(2)))
+        let ocrInitial = ocrHosts.launchOrder[0]
+        let ocrOrdinary = ocrHosts.launchOrder[1]
+        ocrHosts.launchOrder.forEach { ocrHosts.ready($0) }
+        ocrHosts.observations[ocrInitial]?.probeDiagnostic = "ocr_time_budget_exceeded"
+        ocrHosts.observations[ocrInitial]?.heartbeatAt = base.addingTimeInterval(5.9)
+        ocrHosts.observations[ocrInitial]?.candidate = ScanCandidate(rule: "product_not_activated", observedAt: base.addingTimeInterval(1))
+        ocr.tick(now: base.addingTimeInterval(5.9))
+        try expect(ocrHosts.stops.isEmpty && ocr.unactivatedCount == 0,
+            "OCR timeout neither shortens the six-second observation nor turns one candidate into a verdict")
+        ocr.tick(now: base.addingTimeInterval(6))
+        try expect(ocrHosts.stops.count == 2 && ocr.completedCount == 0,
+            "OCR timeout requests stop at the ordinary observation deadline and waits for real exit")
+        ocrHosts.close(ocrInitial)
+        ocr.tick(now: base.addingTimeInterval(7))
+        ocr.tick(now: base.addingTimeInterval(7.5))
+        try expect(ocrHosts.launchOrder.count == 2 && ocr.completedCount == 0,
+            "OCR retry cannot overlap the other owned host while it closes")
+        ocrHosts.close(ocrOrdinary)
+        ocr.tick(now: base.addingTimeInterval(8))
+        ocr.tick(now: base.addingTimeInterval(9))
+        let ocrRetry = ocrHosts.launchOrder.last!
+        try expect(ocrHosts.launchOrder.count == 3 && ocrHosts.targets[ocrRetry]!.isRetry
+            && ocrHosts.targets[ocrRetry]!.previousAttempts?.first?.outcome == .timedOut
+            && ocrHosts.targets[ocrRetry]!.previousAttempts?.first?.reason == "ocr_time_budget_exceeded",
+            "OCR retry retains the explicit timeout and uses the existing single retry task")
+        ocrHosts.observations[ocrRetry]?.startedAt = base.addingTimeInterval(9)
+        ocrHosts.ready(ocrRetry, at: base.addingTimeInterval(9))
+        ocrHosts.observations[ocrRetry]?.probeDiagnostic = "ocr_time_budget_exceeded"
+        ocr.tick(now: base.addingTimeInterval(14.9))
+        try expect(!ocrHosts.stops.contains(ocrRetry), "OCR retry keeps the same six-second observation window")
+        ocr.tick(now: base.addingTimeInterval(15))
+        ocrHosts.close(ocrRetry)
+        ocr.tick(now: base.addingTimeInterval(16))
+        ocr.tick(now: base.addingTimeInterval(17))
+        try expect(ocr.isComplete && ocr.completedCount == 2 && ocrHosts.launchOrder.count == 3,
+            "a second OCR timeout completes without an unbounded retry or inflated product count")
+        try expect(ocr.unactivatedCount == 0 && ocr.results.filter { $0.outcome == .timedOut }.count == 1
+            && ocr.results.first(where: { $0.task.isRetry })?.reason == "ocr_time_budget_exceeded",
+            "failed OCR remains unknown with its fixed reason and never claims licensing")
+        try expect(ocrHosts.checkpointFailures == 0, "OCR retry history is durable before launch")
+
+        let probeCases: [(String, String)] = [
+            ("ocr_native_worker_failed", "ocr_native_worker_failed"),
+            ("ocr_recognition_failed", "ocr_recognition_failed"),
+            ("ocr_time_budget_exceeded: vendor text", "no_supported_explicit_license_status")]
+        for (index, values) in probeCases.enumerated() {
+            let probeDir = root.appendingPathComponent("ocr-no-retry-\(index)")
+            let probe = AutomaticScanner(directory: probeDir, automaticallyTick: false)
+            let probeHosts = Hosts(directory: probeDir, base: base)
+            probeHosts.attach(probe)
+            probe.start(tasks: [tasks[0]])
+            let id = probeHosts.launchOrder[0]
+            probeHosts.ready(id)
+            probeHosts.observations[id]?.probeDiagnostic = values.0
+            probe.tick(now: base.addingTimeInterval(6))
+            probeHosts.close(id)
+            probe.tick(now: base.addingTimeInterval(7))
+            try expect(probe.isComplete && probeHosts.launchOrder.count == 1
+                && probe.results.first?.outcome == .inconclusive && probe.results.first?.reason == values.1,
+                "only an exact OCR timeout retries; recognized failures stay inconclusive and arbitrary text is discarded")
+            try expect(probe.unactivatedCount == 0, "an OCR diagnostic cannot create a license verdict")
+        }
+
+        let recoveredDir = root.appendingPathComponent("ocr-recovered-within-window")
+        let recovered = AutomaticScanner(directory: recoveredDir, automaticallyTick: false)
+        let recoveredHosts = Hosts(directory: recoveredDir, base: base)
+        recoveredHosts.attach(recovered)
+        recovered.start(tasks: [tasks[0]])
+        let recoveredID = recoveredHosts.launchOrder[0]
+        recoveredHosts.ready(recoveredID)
+        recoveredHosts.observations[recoveredID]?.probeDiagnostic = "ocr_time_budget_exceeded"
+        recovered.tick(now: base.addingTimeInterval(3))
+        recoveredHosts.observations[recoveredID]?.probeDiagnostic = "ocr_no_supported_status"
+        recovered.tick(now: base.addingTimeInterval(6))
+        recoveredHosts.close(recoveredID)
+        recovered.tick(now: base.addingTimeInterval(7))
+        try expect(recovered.isComplete && recoveredHosts.launchOrder.count == 1
+            && recovered.results.first?.outcome == .inconclusive
+            && recovered.results.first?.reason == "no_supported_explicit_license_status",
+            "a completed later probe replaces the earlier timeout without a needless retry")
+
+        // One serial second pass for explicit creation failures/timeouts. It
+        // starts only after ordinary tasks and all prior hosts have exited.
+        let retryDir = root.appendingPathComponent("bounded-serial-retry")
+        let retry = AutomaticScanner(directory: retryDir, automaticallyTick: false)
+        let retryHosts = Hosts(directory: retryDir, base: base)
+        retryHosts.attach(retry)
+        retry.start(tasks: Array(tasks.prefix(4)))
+        let retryFirst = retryHosts.launchOrder
+        retryHosts.observations[retryFirst[0]]?.state = "error"
+        retryHosts.observations[retryFirst[0]]?.failureReason = "instance_creation_failed"
+        retry.tick(now: base.addingTimeInterval(1))
+        retryHosts.close(retryFirst[0], state: "error")
+        retry.tick(now: base.addingTimeInterval(2))
+        try expect(retry.completedCount == 0 && retry.totalCount == 4, "first failed attempt does not inflate completion or totals")
+        retry.tick(now: base.addingTimeInterval(3))
+        let ordinaryThird = retryHosts.launchOrder.last!
+        try expect(!retryHosts.targets[ordinaryThird]!.isRetry && retryHosts.launchOrder.count == 3,
+            "ordinary pending task runs while the retry waits")
+        retryHosts.ready(ordinaryThird, at: base.addingTimeInterval(3))
+        retry.tick(now: base.addingTimeInterval(9))
+        retryHosts.close(ordinaryThird)
+        retry.tick(now: base.addingTimeInterval(10))
+        retry.tick(now: base.addingTimeInterval(25))
+        retryHosts.close(retryFirst[1])
+        retry.tick(now: base.addingTimeInterval(26))
+        retry.tick(now: base.addingTimeInterval(27))
+        let ordinaryFourth = retryHosts.launchOrder.last!
+        try expect(retryHosts.launchOrder.count == 4 && !retryHosts.targets[ordinaryFourth]!.isRetry,
+            "another worker's ordinary queue prevents an early retry launch")
+        retryHosts.ready(ordinaryFourth, at: base.addingTimeInterval(27))
+        retry.tick(now: base.addingTimeInterval(33))
+        retryHosts.close(ordinaryFourth)
+        retry.tick(now: base.addingTimeInterval(34))
+        retry.tick(now: base.addingTimeInterval(35))
+        let retryOne = retryHosts.launchOrder.last!
+        retryHosts.observations[retryOne]?.startedAt = base.addingTimeInterval(35)
+        try expect(retryHosts.targets[retryOne]!.isRetry && retryHosts.targets[retryOne]!.launchBudgetSeconds == 60
+            && retryHosts.targets[retryOne]!.previousAttempts?.first?.reason == "instance_creation_failed",
+            "first retry carries its own creation failure and longer request budget")
+        retry.tick(now: base.addingTimeInterval(84))
+        try expect(retryHosts.launchOrder.count == 5 && !retryHosts.stops.contains(retryOne),
+            "slow retry loading receives more than 25 seconds and blocks every other launch")
+        retryHosts.ready(retryOne, at: base.addingTimeInterval(85))
+        retry.tick(now: base.addingTimeInterval(85))
+        retry.tick(now: base.addingTimeInterval(91))
+        retryHosts.close(retryOne)
+        retry.tick(now: base.addingTimeInterval(92))
+        let retryTwo = retryHosts.launchOrder.last!
+        retryHosts.observations[retryTwo]?.startedAt = base.addingTimeInterval(93)
+        retry.tick(now: base.addingTimeInterval(93))
+        try expect(retryHosts.launchOrder.count == 6 && retryHosts.targets[retryTwo]!.isRetry,
+            "second worker's retry launches only after the first retry really exits")
+        retry.tick(now: base.addingTimeInterval(152.9))
+        try expect(!retryHosts.stops.contains(retryTwo), "retry startup remains allowed before 60 seconds")
+        retry.tick(now: base.addingTimeInterval(153))
+        retryHosts.close(retryTwo)
+        retry.tick(now: base.addingTimeInterval(154))
+        retry.tick(now: base.addingTimeInterval(155))
+        try expect(retry.isComplete && retry.completedCount == 4 && retryHosts.launchOrder.count == 6,
+            "second failure ends the bounded retry pass with one result per product")
+        try expect(retry.unactivatedCount == 0 && retry.results.filter { $0.task.isRetry }.count == 2
+            && retry.results.filter { $0.outcome == .timedOut }.count == 1,
+            "retry preserves failed-attempt history without claiming authorization")
+        try expect(retryHosts.checkpointFailures == 0, "retry target/history is durable before every launch")
+
+        let noRetryDir = root.appendingPathComponent("nonretryable-exits")
+        let noRetry = AutomaticScanner(directory: noRetryDir, automaticallyTick: false)
+        let noRetryHosts = Hosts(directory: noRetryDir, base: base)
+        noRetryHosts.attach(noRetry)
+        noRetry.start(tasks: Array(tasks.prefix(2)))
+        noRetryHosts.observations[noRetryHosts.launchOrder[0]]?.failureReason = "no_custom_editor"
+        noRetryHosts.launchOrder.forEach { noRetryHosts.close($0, state: "error") }
+        noRetry.tick(now: base.addingTimeInterval(1))
+        try expect(noRetry.isComplete && noRetryHosts.launchOrder.count == 2,
+            "permanent editor absence and unexpected exits do not auto-retry")
+        try expect(Set(noRetry.results.map(\.reason)) == Set(["no_custom_editor", "host_exited_with_error"]),
+            "nonretryable failures retain per-task diagnostics")
+
+        let pausedRetryDir = root.appendingPathComponent("pause-retry")
+        let pausedRetry = AutomaticScanner(directory: pausedRetryDir, automaticallyTick: false)
+        let pausedRetryHosts = Hosts(directory: pausedRetryDir, base: base)
+        pausedRetryHosts.attach(pausedRetry)
+        pausedRetry.start(tasks: [tasks[0]])
+        let pausedInitial = pausedRetryHosts.launchOrder[0]
+        pausedRetryHosts.observations[pausedInitial]?.failureReason = "instance_creation_failed"
+        pausedRetryHosts.close(pausedInitial, state: "error")
+        pausedRetry.tick(now: base.addingTimeInterval(1))
+        pausedRetry.tick(now: base.addingTimeInterval(2))
+        let pausedID = pausedRetryHosts.launchOrder.last!
+        pausedRetry.pause()
+        try expect(pausedRetry.isStopping && pausedRetryHosts.targets[pausedID]!.isRetry,
+            "pause waits for the owned retry instead of consuming another attempt")
+        pausedRetryHosts.close(pausedID)
+        pausedRetry.tick(now: base.addingTimeInterval(3))
+        pausedRetry.shutdown()
+        let resumedRetry = AutomaticScanner(directory: pausedRetryDir, automaticallyTick: false)
+        let resumedRetryHosts = Hosts(directory: pausedRetryDir, base: base)
+        resumedRetryHosts.attach(resumedRetry)
+        try expect(resumedRetry.canResume && resumedRetry.completedCount == 0 && resumedRetryHosts.launchOrder.isEmpty,
+            "retry reload preserves the unfinished task without launching anything")
+        resumedRetry.resume()
+        let resumedID = resumedRetryHosts.launchOrder[0]
+        try expect(resumedRetryHosts.targets[resumedID]!.previousAttempts?.count == 1,
+            "resumed retry retains the initial failure exactly once")
+        resumedRetryHosts.observations[resumedID]?.failureReason = "instance_creation_failed"
+        resumedRetryHosts.close(resumedID, state: "error")
+        resumedRetry.tick(now: base.addingTimeInterval(4))
+        try expect(resumedRetry.isComplete && resumedRetry.completedCount == 1 && resumedRetryHosts.launchOrder.count == 1,
+            "a failed resumed retry completes without another automatic attempt")
 
         // A late first label can wait for the next sample, but is never a verdict.
         let lateDir = root.appendingPathComponent("late-candidate")
-        let late = AutomaticScanner(directory: lateDir, automaticallyTick: false)
+        let late = AutomaticScanner(directory: lateDir, automaticallyTick: false, automaticallyRetryFailures: false)
         let lateHosts = Hosts(directory: lateDir, base: base)
         lateHosts.attach(late)
         late.start(tasks: Array(tasks.prefix(2)))
@@ -209,53 +433,53 @@ final class Hosts {
             lateHosts.ready(id)
             lateHosts.observations[id]?.classID = "late-\(index)"
             lateHosts.observations[id]?.candidate = ScanCandidate(rule: "license_expired",
-                observedAt: base.addingTimeInterval(index == 0 ? 3.5 : 3.99))
+                observedAt: base.addingTimeInterval(index == 0 ? 5.5 : 5.99))
         }
-        late.tick(now: base.addingTimeInterval(4))
-        late.tick(now: base.addingTimeInterval(5))
+        late.tick(now: base.addingTimeInterval(6))
+        late.tick(now: base.addingTimeInterval(7))
         try expect(lateHosts.stops.isEmpty && late.unactivatedCount == 0 && late.completedCount == 0,
             "late first candidates extend observation but never create a license verdict")
         lateHosts.observations[lateIDs[0]]?.needsActivation = true
         lateHosts.observations[lateIDs[0]]?.evidenceRule = "license_expired"
-        late.tick(now: base.addingTimeInterval(5.5))
+        late.tick(now: base.addingTimeInterval(7.5))
         try expect(lateHosts.stops == [lateIDs[0]], "confirmed second sample can finish during candidate grace")
         lateHosts.observations[lateIDs[1]]?.candidate = nil
-        late.tick(now: base.addingTimeInterval(5.5))
+        late.tick(now: base.addingTimeInterval(7.5))
         try expect(Set(lateHosts.stops) == Set(lateIDs), "candidate disappearance restores the ordinary elapsed deadline")
         lateIDs.forEach { lateHosts.close($0) }
-        late.tick(now: base.addingTimeInterval(6))
+        late.tick(now: base.addingTimeInterval(8))
         try expect(late.isComplete && late.unactivatedCount == 1 && late.inconclusiveCount == 1,
             "only confirmed evidence is retained; withdrawn candidate remains inconclusive")
         try expect(late.results.filter { $0.outcome == .inconclusive }.allSatisfy { $0.reason != "license_expired" },
             "candidate rule is not persisted as a completed licensing reason")
 
-        // Changing/repeated candidates cannot slide the fixed ready + 6.5 cap.
+        // Changing/repeated candidates cannot slide the fixed ready + 8.5 cap.
         let capDir = root.appendingPathComponent("candidate-cap")
-        let cap = AutomaticScanner(directory: capDir, automaticallyTick: false)
+        let cap = AutomaticScanner(directory: capDir, automaticallyTick: false, automaticallyRetryFailures: false)
         let capHosts = Hosts(directory: capDir, base: base)
         capHosts.attach(cap)
         cap.start(tasks: Array(tasks.prefix(2)))
         for (index, id) in capHosts.launchOrder.enumerated() {
             capHosts.ready(id)
             capHosts.observations[id]?.classID = "cap-\(index)"
-            capHosts.observations[id]?.candidate = ScanCandidate(rule: "license_expired", observedAt: base.addingTimeInterval(3.8))
+            capHosts.observations[id]?.candidate = ScanCandidate(rule: "license_expired", observedAt: base.addingTimeInterval(5.8))
         }
-        cap.tick(now: base.addingTimeInterval(4))
+        cap.tick(now: base.addingTimeInterval(6))
         for id in capHosts.launchOrder {
-            capHosts.observations[id]?.candidate = ScanCandidate(rule: "demo_mode", observedAt: base.addingTimeInterval(5.9))
+            capHosts.observations[id]?.candidate = ScanCandidate(rule: "demo_mode", observedAt: base.addingTimeInterval(7.9))
             capHosts.observations[id]?.readyAt = base.addingTimeInterval(30)
         }
-        cap.tick(now: base.addingTimeInterval(6.49))
+        cap.tick(now: base.addingTimeInterval(8.49))
         try expect(capHosts.stops.isEmpty, "replaced candidate can use remaining fixed grace")
-        cap.tick(now: base.addingTimeInterval(6.5))
+        cap.tick(now: base.addingTimeInterval(8.5))
         try expect(capHosts.stops.count == 2 && cap.unactivatedCount == 0,
-            "candidate changes and repeated ready reports cannot extend ready plus 6.5 seconds")
+            "candidate changes and repeated ready reports cannot extend ready plus 8.5 seconds")
         capHosts.launchOrder.forEach { capHosts.close($0) }
-        cap.tick(now: base.addingTimeInterval(7))
+        cap.tick(now: base.addingTimeInterval(9))
         try expect(cap.results.allSatisfy { $0.outcome == .inconclusive }, "unconfirmed candidates expire as inconclusive")
 
         let absoluteDir = root.appendingPathComponent("candidate-absolute-cap")
-        let absolute = AutomaticScanner(directory: absoluteDir, automaticallyTick: false)
+        let absolute = AutomaticScanner(directory: absoluteDir, automaticallyTick: false, automaticallyRetryFailures: false)
         let absoluteHosts = Hosts(directory: absoluteDir, base: base)
         absoluteHosts.attach(absolute)
         absolute.start(tasks: Array(tasks.prefix(2)))
@@ -265,14 +489,18 @@ final class Hosts {
             absoluteHosts.observations[id]?.candidate = ScanCandidate(rule: "demo_mode", observedAt: base.addingTimeInterval(24.5))
         }
         absolute.tick(now: base.addingTimeInterval(24.9))
-        try expect(absoluteHosts.stops.isEmpty, "late-ready candidate can observe only until absolute cap")
+        try expect(absoluteHosts.stops.isEmpty, "late-ready candidate remains within its observation window")
         absolute.tick(now: base.addingTimeInterval(25))
-        try expect(absoluteHosts.stops.count == 2, "candidate grace cannot extend the absolute 25 second limit")
+        try expect(absoluteHosts.stops.isEmpty, "reaching ready before the startup deadline preserves the full observation window")
+        absolute.tick(now: base.addingTimeInterval(28))
+        try expect(absoluteHosts.stops.count == 2, "late-ready candidate still stops at its bounded observation deadline")
         absoluteHosts.launchOrder.forEach { absoluteHosts.close($0) }
-        absolute.tick(now: base.addingTimeInterval(26))
-        try expect(absolute.results.allSatisfy { $0.outcome == .timedOut }, "absolute candidate cap is recorded as timeout")
+        absolute.tick(now: base.addingTimeInterval(29))
+        try expect(absolute.results.allSatisfy { $0.outcome == .inconclusive }, "unconfirmed late-ready candidate stays inconclusive rather than a startup timeout")
 
         try expect(ScanCandidate(rule: "arbitrary UI text", observedAt: base) == nil, "candidate rejects unknown rules")
+        try expect(ScanCandidate(rule: "activation_form", observedAt: base) != nil,
+            "corroborated activation forms can receive the same bounded second-observation grace")
         try expect(ScanCandidate(rule: "license_expired", observedAt: Date(timeIntervalSince1970: .nan)) == nil,
             "candidate rejects non-finite timestamp")
         try expect(ScanCandidate(rule: "license_expired", observedAt: Date(timeIntervalSince1970: 0)) == nil,
@@ -280,11 +508,21 @@ final class Hosts {
         for time in [-1.0, 0.0, 1.0, 7.0] {
             let candidate = ScanCandidate(rule: "license_expired", observedAt: base.addingTimeInterval(time))
             let deadline = AutomaticScanner.observationDeadline(readyAt: base, startedAt: base,
-                candidate: candidate, now: base.addingTimeInterval(4))
-            try expect(deadline == base.addingTimeInterval(4), "old, early, or future candidates do not extend observation")
+                candidate: candidate, now: base.addingTimeInterval(6))
+            try expect(deadline == base.addingTimeInterval(6), "old, early, or future candidates do not extend observation")
+        }
+        for budget in [25.0, 60.0] {
+            let ready = base.addingTimeInterval(budget)
+            let at = ready.addingTimeInterval(6)
+            let candidate = ScanCandidate(rule: "activation_form", observedAt: at)
+            let deadline = AutomaticScanner.observationDeadline(readyAt: ready, startedAt: base,
+                candidate: candidate, now: at, startupBudget: budget)
+            try expect(deadline == base.addingTimeInterval(budget + 8.5)
+                && deadline < base.addingTimeInterval(budget + 10),
+                "six-second OCR observation plus candidate grace remains inside both host watchdog budgets")
         }
         let unidentifiedDir = root.appendingPathComponent("unidentified-candidate")
-        let unidentified = AutomaticScanner(directory: unidentifiedDir, automaticallyTick: false)
+        let unidentified = AutomaticScanner(directory: unidentifiedDir, automaticallyTick: false, automaticallyRetryFailures: false)
         let unidentifiedHosts = Hosts(directory: unidentifiedDir, base: base)
         unidentifiedHosts.attach(unidentified)
         unidentified.start(tasks: Array(tasks.prefix(2)))
@@ -292,14 +530,14 @@ final class Hosts {
             unidentifiedHosts.ready(id)
             unidentifiedHosts.observations[id]?.candidate = ScanCandidate(rule: "license_expired", observedAt: base.addingTimeInterval(3.5))
         }
-        unidentified.tick(now: base.addingTimeInterval(4))
+        unidentified.tick(now: base.addingTimeInterval(6))
         try expect(unidentifiedHosts.stops.count == 2, "candidate without selected class cannot extend the deadline")
         for controller in [late, cap, absolute, unidentified] { controller.shutdown() }
 
         // Save failures stop every owned host, keep unfinished checkpoints,
         // and require an explicit reload before allowing resume.
         let conflictDir = root.appendingPathComponent("license-conflict")
-        let conflict = AutomaticScanner(directory: conflictDir, automaticallyTick: false)
+        let conflict = AutomaticScanner(directory: conflictDir, automaticallyTick: false, automaticallyRetryFailures: false)
         let conflictHosts = Hosts(directory: conflictDir, base: base)
         conflictHosts.attach(conflict)
         conflict.start(tasks: Array(tasks.prefix(2)))
@@ -317,7 +555,7 @@ final class Hosts {
         // Own queue-file conflicts receive the same protection as license-file
         // conflicts; externally modified bytes must remain untouched.
         let queueDir = root.appendingPathComponent("queue-conflict")
-        let queue = AutomaticScanner(directory: queueDir, automaticallyTick: false)
+        let queue = AutomaticScanner(directory: queueDir, automaticallyTick: false, automaticallyRetryFailures: false)
         let queueHosts = Hosts(directory: queueDir, base: base)
         queueHosts.attach(queue)
         queue.start(tasks: Array(tasks.prefix(2)))
@@ -334,7 +572,7 @@ final class Hosts {
         // Starting a scan replaces both workers together. A second-worker
         // conflict must preserve every previous result and never launch a host.
         let atomicDir = root.appendingPathComponent("atomic-start")
-        let atomic = AutomaticScanner(directory: atomicDir, automaticallyTick: false)
+        let atomic = AutomaticScanner(directory: atomicDir, automaticallyTick: false, automaticallyRetryFailures: false)
         let atomicHosts = Hosts(directory: atomicDir, base: base)
         atomicHosts.failLaunch = true
         atomicHosts.attach(atomic)
@@ -381,7 +619,7 @@ final class Hosts {
             "failed unpublished generation is removed without touching previous generations")
 
         // An old controller cannot overwrite a newly published generation.
-        let competing = AutomaticScanner(directory: atomicDir, automaticallyTick: false)
+        let competing = AutomaticScanner(directory: atomicDir, automaticallyTick: false, automaticallyRetryFailures: false)
         let competingHosts = Hosts(directory: atomicDir, base: base)
         competingHosts.failLaunch = true
         competingHosts.attach(competing)
@@ -402,7 +640,7 @@ final class Hosts {
         }
         let legacyFile = legacyDir.appendingPathComponent("worker-0/autoscan-state.json")
         let legacyBytes = try Data(contentsOf: legacyFile)
-        let legacy = AutomaticScanner(directory: legacyDir, automaticallyTick: false)
+        let legacy = AutomaticScanner(directory: legacyDir, automaticallyTick: false, automaticallyRetryFailures: false)
         try expect(legacy.completedCount == 2 && legacy.isComplete && legacy.checkpointDirectory == legacyDir,
             "old worker directories load without a manifest")
         let legacyHosts = Hosts(directory: legacyDir, base: base)
@@ -412,7 +650,7 @@ final class Hosts {
         try expect(legacy.isComplete && legacy.checkpointDirectory != legacyDir,
             "starting from legacy storage publishes the new complete generation")
         try expect(try Data(contentsOf: legacyFile) == legacyBytes, "migration preserves all legacy checkpoint bytes")
-        let migrated = AutomaticScanner(directory: legacyDir, automaticallyTick: false)
+        let migrated = AutomaticScanner(directory: legacyDir, automaticallyTick: false, automaticallyRetryFailures: false)
         try expect(migrated.results == legacy.results && migrated.isComplete,
             "reload follows the new manifest instead of stale legacy checkpoints")
 
@@ -426,7 +664,7 @@ final class Hosts {
             try FileManager.default.createDirectory(at: invalidDir, withIntermediateDirectories: true)
             let manifest = invalidDir.appendingPathComponent("current-run.json")
             try document.write(to: manifest)
-            let invalid = AutomaticScanner(directory: invalidDir, automaticallyTick: false)
+            let invalid = AutomaticScanner(directory: invalidDir, automaticallyTick: false, automaticallyRetryFailures: false)
             invalid.start(tasks: Array(tasks.prefix(2)))
             try expect(!invalid.error.isEmpty && invalid.runs.isEmpty && !invalid.canResume,
                 "invalid or incomplete manifest is rejected: " + name)
@@ -436,7 +674,7 @@ final class Hosts {
         // Product metadata expands siblings exactly once, with known siblings
         // excluded and repeated polls producing no redundant @Published run.
         let classDir = root.appendingPathComponent("classes")
-        let classes = AutomaticScanner(directory: classDir, automaticallyTick: false)
+        let classes = AutomaticScanner(directory: classDir, automaticallyTick: false, automaticallyRetryFailures: false)
         let classHosts = Hosts(directory: classDir, base: base)
         classHosts.knownClasses = ["class-C"]
         classHosts.attach(classes)
@@ -459,7 +697,7 @@ final class Hosts {
         try expect(!classes.error.isEmpty && classes.completedCount == 0, "changed class identity stops scan rather than misapplying result")
 
         let missingDir = root.appendingPathComponent("missing-ownership")
-        let missing = AutomaticScanner(directory: missingDir, automaticallyTick: false)
+        let missing = AutomaticScanner(directory: missingDir, automaticallyTick: false, automaticallyRetryFailures: false)
         let missingHosts = Hosts(directory: missingDir, base: base)
         missingHosts.attach(missing)
         missing.start(tasks: Array(tasks.prefix(4)))
@@ -470,7 +708,7 @@ final class Hosts {
             "missing ownership evidence cannot release a live slot")
 
         let failuresDir = root.appendingPathComponent("launch-failures")
-        let failures = AutomaticScanner(directory: failuresDir, automaticallyTick: false)
+        let failures = AutomaticScanner(directory: failuresDir, automaticallyTick: false, automaticallyRetryFailures: false)
         let failedHosts = Hosts(directory: failuresDir, base: base)
         failedHosts.failLaunch = true
         failedHosts.attach(failures)
@@ -482,7 +720,7 @@ final class Hosts {
 
         // Verify live file identity again before any automatic launch.
         let changedDir = root.appendingPathComponent("binary-changed")
-        let changed = AutomaticScanner(directory: changedDir, automaticallyTick: false)
+        let changed = AutomaticScanner(directory: changedDir, automaticallyTick: false, automaticallyRetryFailures: false)
         let changedHosts = Hosts(directory: changedDir, base: base)
         changedHosts.attach(changed)
         let binary = URL(fileURLWithPath: entries[0].path).appendingPathComponent("Contents/MacOS/Fixture")
@@ -507,7 +745,7 @@ final class Hosts {
             try csvRun.finishCurrent(outcome: .inconclusive, reason: task.productName, checkedAt: base)
         }
         try AutoScanStore(directory: csvDir.appendingPathComponent("worker-0")).save(csvRun)
-        let csvScanner = AutomaticScanner(directory: csvDir, automaticallyTick: false)
+        let csvScanner = AutomaticScanner(directory: csvDir, automaticallyTick: false, automaticallyRetryFailures: false)
         try expect(csvScanner.writeReport(), "successful CSV export confirms the file can be opened")
         try expect(csvScanner.isComplete && csvScanner.results.count == csvValues.count,
             "CSV fixture exports actual stored results without opening any plugins")

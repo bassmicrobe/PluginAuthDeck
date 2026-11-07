@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import plistlib
 import shutil
 import sys
 import tempfile
@@ -22,9 +23,11 @@ class FakeCommands:
     def __init__(self, run, state, status='Accepted', submit_code=0):
         self.run, self.state, self.status, self.submit_code = run, state, status, submit_code
         self.calls = []
+        self.arguments = {}
 
     def call(self, label, args, timeout=120, output=None, check=True):
         self.calls.append(label)
+        self.arguments[label] = list(args)
         out, err = self.run / (output or label + '.out'), self.run / (label + '.err')
         out.write_text('')
         err.write_text('')
@@ -59,6 +62,45 @@ class FakeCommands:
         elif label in ('gatekeeper', 'assess-extracted'):
             err.write_text('accepted\nsource=Notarized Developer ID\n')
         return out, err, {'returncode': code}
+
+
+class FakeSignatureCommands:
+    """Synthetic codesign/lipo receipts; never execute a signing command."""
+    leaf = b'synthetic developer-id certificate for entitlement regression checks'
+
+    def __init__(self, run, state, entitlements=None, missing_runtime=None):
+        self.run, self.state = run, state
+        self.logs = run / 'signature-logs'
+        self.logs.mkdir(exist_ok=True)
+        self.calls = []
+        self.entitlements = {
+            'launcher-arm64': {},
+            'helper-arm64': dict(release.ENTITLEMENTS),
+            'helper-x86_64': dict(release.ENTITLEMENTS),
+        }
+        self.entitlements.update(entitlements or {})
+        self.missing_runtime = missing_runtime
+
+    def call(self, label, args, **kwargs):
+        self.calls.append(label)
+        out, err = self.logs / (label + '.out'), self.logs / (label + '.err')
+        out.write_bytes(b'')
+        err.write_bytes(b'')
+        if label.startswith('architectures-'):
+            out.write_text('arm64' if label.endswith('launcher') else 'arm64 x86_64')
+        elif label.startswith('signature-'):
+            target = label.removeprefix('signature-')
+            runtime = '' if target == self.missing_runtime else 'flags=0x10000(runtime)\n'
+            err.write_text('Authority=Developer ID Application: Fixture\n'
+                + 'TeamIdentifier=' + self.state['team_id'] + '\n' + runtime
+                + 'Timestamp=Nov 7, 2026 at 12:00:00\nCDHash=' + 'a' * 40 + '\n')
+        elif label.startswith('entitlements-'):
+            out.write_bytes(plistlib.dumps(self.entitlements[label.removeprefix('entitlements-')]))
+        elif label.startswith('certificate-'):
+            prefix = next(str(arg).split('=', 1)[1] for arg in args
+                          if str(arg).startswith('--extract-certificates='))
+            Path(prefix + '0').write_bytes(self.leaf)
+        return out, err, {'returncode': 0}
 
 
 class ReleaseTests(unittest.TestCase):
@@ -151,6 +193,68 @@ class ReleaseTests(unittest.TestCase):
                 release.validate_output_root(source, destination)
         release.validate_output_root(source, self.run / 'results')
 
+    def test_only_the_two_reviewed_host_exceptions_are_packaged(self):
+        expected = {
+            'com.apple.security.cs.disable-library-validation': True,
+            'com.apple.security.cs.allow-unsigned-executable-memory': True,
+        }
+        packaged = plistlib.loads((release.ROOT / 'packaging/host-entitlements.plist').read_bytes())
+        self.assertEqual(release.ENTITLEMENTS, expected)
+        self.assertEqual(packaged, expected)
+
+    def signature_state(self):
+        return dict(self.state, identity=hashlib.sha1(FakeSignatureCommands.leaf).hexdigest().upper())
+
+    def test_signature_verifier_accepts_only_reviewed_helper_and_empty_launcher(self):
+        state = self.signature_state()
+        commands = FakeSignatureCommands(self.run, state)
+        signatures = release.verify_signatures(commands, self.run / release.APP_NAME, state)
+        self.assertEqual(set(signatures), {'launcher-arm64', 'helper-arm64', 'helper-x86_64'})
+        self.assertEqual({label for label in commands.calls if label.startswith('entitlements-')},
+                         {'entitlements-launcher-arm64', 'entitlements-helper-arm64', 'entitlements-helper-x86_64'})
+
+    def test_signature_verifier_rejects_host_exceptions_on_launcher(self):
+        state = self.signature_state()
+        for key in (*release.ENTITLEMENTS, 'com.apple.security.cs.allow-jit'):
+            with self.subTest(entitlement=key):
+                commands = FakeSignatureCommands(self.run, state, {'launcher-arm64': {key: True}})
+                with self.assertRaisesRegex(RuntimeError, 'Unexpected entitlements: launcher'):
+                    release.verify_signatures(commands, self.run / release.APP_NAME, state)
+
+    def test_signature_verifier_rejects_extra_helper_exceptions_on_each_architecture(self):
+        state = self.signature_state()
+        for arch in ('arm64', 'x86_64'):
+            for extra in ('com.apple.security.cs.allow-jit', 'com.apple.security.get-task-allow',
+                          'com.apple.security.cs.disable-executable-page-protection'):
+                with self.subTest(architecture=arch, extra=extra):
+                    actual = dict(release.ENTITLEMENTS, **{extra: True})
+                    commands = FakeSignatureCommands(self.run, state, {'helper-' + arch: actual})
+                    with self.assertRaisesRegex(RuntimeError, 'Unexpected entitlements: helper'):
+                        release.verify_signatures(commands, self.run / release.APP_NAME, state)
+
+    def test_signature_verifier_requires_both_helper_exceptions_on_each_architecture(self):
+        state = self.signature_state()
+        for arch in ('arm64', 'x86_64'):
+            for key in release.ENTITLEMENTS:
+                for missing in (True, False):
+                    with self.subTest(architecture=arch, entitlement=key, missing=missing):
+                        actual = dict(release.ENTITLEMENTS)
+                        if missing:
+                            actual.pop(key)
+                        else:
+                            actual[key] = False
+                        commands = FakeSignatureCommands(self.run, state, {'helper-' + arch: actual})
+                        with self.assertRaisesRegex(RuntimeError, 'Unexpected entitlements: helper'):
+                            release.verify_signatures(commands, self.run / release.APP_NAME, state)
+
+    def test_runtime_remains_required_with_the_host_compatibility_exception(self):
+        state = self.signature_state()
+        for target in ('launcher-arm64', 'helper-arm64', 'helper-x86_64'):
+            with self.subTest(target=target):
+                commands = FakeSignatureCommands(self.run, state, missing_runtime=target)
+                with self.assertRaisesRegex(RuntimeError, 'hardened runtime'):
+                    release.verify_signatures(commands, self.run / release.APP_NAME, state)
+
     def test_final_zip_contains_stapled_parent_bundle_and_matches_hash(self):
         app = self.run / release.APP_NAME
         app.mkdir()
@@ -217,6 +321,14 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.state['stage'], 'prepared')
         self.assertNotIn('failed_preparations', self.state)
         self.assertEqual(release.tree_digest(self.run / release.APP_NAME), release.tree_digest(source))
+        helper_args = commands.arguments['sign-helper']
+        launcher_args = commands.arguments['sign-launcher']
+        self.assertEqual(helper_args[helper_args.index('--entitlements') + 1], self.run / 'host-entitlements.plist')
+        self.assertNotIn('--entitlements', launcher_args, 'parent must not inherit plug-in-host exceptions')
+        for args in (helper_args, launcher_args):
+            self.assertEqual(args[args.index('--options') + 1], 'runtime')
+            self.assertIn('--timestamp', args)
+            self.assertNotIn('--deep', args, 'sign the helper and parent explicitly')
 
     def test_command_failure_and_timeout_keep_logs(self):
         commands = release.Commands(self.run)

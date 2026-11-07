@@ -26,6 +26,16 @@ enum FixtureFailure: Error, CustomStringConvertible {
     }
 }
 
+final class FakeOCRPreparation: OCRPreparationTask {
+    var isRunning = true
+    var cancellations = 0
+    let completion: (OCRPreparationOutcome) -> Void
+    init(_ completion: @escaping (OCRPreparationOutcome) -> Void) { self.completion = completion }
+    func cancel() { cancellations += 1 }
+    func finish(_ result: OCRPreparationOutcome) { isRunning = false; completion(result) }
+    func replay(_ result: OCRPreparationOutcome) { completion(result) }
+}
+
 @main struct ModelFixtures {
     static var checks = 0
 
@@ -132,6 +142,238 @@ enum FixtureFailure: Error, CustomStringConvertible {
             "valid Unicode inventory loads after the invalid cache is replaced")
     }
 
+    static func requestFixtures(_ entry: Entry) throws {
+        let ordinary = AutoScanTask(entry: entry)
+        let retry = AutoScanTask(entry: entry, classID: "selected-class", previousAttempts: [
+            AutoScanAttempt(outcome: .timedOut, reason: "creating_instance_heartbeat_stalled", checkedAt: Date())])
+        for (task, expected) in [(ordinary, 35), (retry, 70)] {
+            let request = DeskModel.hostRequest(entry: task.entry, classID: task.classID, automatic: true,
+                scanBudgetSeconds: task.launchBudgetSeconds, parentPID: 12345)
+            let decoded = try JSONSerialization.jsonObject(with: JSONSerialization.data(withJSONObject: request)) as! [String: Any]
+            try expect(decoded["scanDeadlineSeconds"] as? Int == expected && decoded["mode"] as? String == "scan",
+                "ordinary/retry task budget reaches the serialized host request as 35/70 seconds")
+            try expect(decoded["path"] as? String == entry.path && decoded["identifier"] as? String == entry.identifier
+                && decoded["classID"] as? String == task.classID && decoded["parentPID"] as? Int == 12345,
+                "deadline selection does not change the requested plug-in/class or parent ownership")
+        }
+        let manual = DeskModel.hostRequest(entry: entry, classID: "manual-class", automatic: false,
+            scanBudgetSeconds: 60, parentPID: 12345)
+        try expect(manual["mode"] as? String == "manual" && manual["scanDeadlineSeconds"] == nil,
+            "manual authorization sessions never inherit an automatic scan deadline")
+        for budget in [0.0, -1.0, 1000000.0, Double.nan, Double.infinity] {
+            let request = DeskModel.hostRequest(entry: entry, classID: "", automatic: true,
+                scanBudgetSeconds: budget, parentPID: 12345)
+            try expect(request["scanDeadlineSeconds"] as? Int == 35 && JSONSerialization.isValidJSONObject(request),
+                "unexpected launch budgets cannot create an unbounded or invalid JSON host deadline")
+        }
+    }
+
+    static func preparationFixtures(_ root: URL, entries: [Entry]) throws {
+        try expect(OCRPreparationProcess.validResponse(Data("{\"version\":1,\"ready\":true}".utf8)),
+            "warmup accepts only its positive fixed typed response")
+        for json in ["", "{}", "[]", "{\"version\":true,\"ready\":true}",
+                     "{\"version\":1,\"ready\":1}", "{\"version\":1,\"ready\":false}",
+                     "{\"version\":2,\"ready\":true}", "{\"version\":1,\"ready\":true,\"text\":\"extra\"}",
+                     "{\"version\":1,\"ready\":true} trailing", String(repeating: " ", count: 4097)] {
+            try expect(!OCRPreparationProcess.validResponse(Data(json.utf8)), "malformed or unbounded preparation output cannot start a scan")
+        }
+        let model = DeskModel(directory: root.appendingPathComponent("preparation-success"),
+            initialEntries: [entries[0]], refreshOnLaunch: false)
+        var jobs: [FakeOCRPreparation] = []
+        model.prepareOCR = { _, completion in let job = FakeOCRPreparation(completion); jobs.append(job); return job }
+        var launches = 0
+        model.automaticScanner.launch = { _ in launches += 1; return nil }
+        model.startAutomaticScan()
+        try expect(model.preparingAutomaticScan && jobs.count == 1 && launches == 0
+            && model.automaticScanner.totalCount == 0, "preparation precedes every queue write and plug-in launch")
+        model.startAutomaticScan()
+        model.resumeAutomaticScan()
+        try expect(jobs.count == 1, "repeated start or resume cannot duplicate a preparation")
+        try expect(model.open(entries[0]) == nil && model.sessions.isEmpty,
+            "manual plugin launch is blocked while preparing")
+        model.category = "プラグイン"
+        model.startReview()
+        model.refresh()
+        try expect(model.workflow == nil && !model.scanning,
+            "manual workflow and inventory refresh cannot race preparation")
+        model.entries = entries
+        model.query = "hidden-all"
+        model.format = "AU"
+        model.favoritesOnly = true
+        model.favorites = []
+        jobs[0].finish(.ready)
+        try expect(!model.preparingAutomaticScan && model.automaticScanner.totalCount == entries.count && launches == 2,
+            "successful preparation starts the latest complete pending inventory regardless of UI filters")
+        jobs[0].replay(.ready)
+        try expect(launches == 2, "a duplicate ready callback cannot start the queue again")
+        model.automaticScanner.tick()
+        model.automaticScanner.tick()
+        try expect(model.automaticScanner.isComplete, "fake hosts finish without any real plugin")
+        model.startAutomaticScan()
+        try expect(jobs.count == 1 && !model.preparingAutomaticScan,
+            "successful warmup is cached only for this model lifetime")
+        model.automaticScanner.shutdown()
+
+        let cancelled = DeskModel(directory: root.appendingPathComponent("preparation-cancel"),
+            initialEntries: [entries[0]], refreshOnLaunch: false)
+        var cancellationJobs: [FakeOCRPreparation] = []
+        cancelled.prepareOCR = { _, completion in let job = FakeOCRPreparation(completion); cancellationJobs.append(job); return job }
+        var cancelledLaunches = 0
+        cancelled.automaticScanner.launch = { _ in cancelledLaunches += 1; return nil }
+        cancelled.startAutomaticScan()
+        cancelled.cancelAutomaticPreparation()
+        cancelled.startAutomaticScan()
+        try expect(cancelled.preparingAutomaticScan && cancelled.stoppingAutomaticPreparation
+            && cancellationJobs.count == 1 && cancellationJobs[0].cancellations == 1,
+            "cancel retains the owned preparation until exit and prevents overlapping restart")
+        cancellationJobs[0].finish(.ready)
+        try expect(!cancelled.preparingAutomaticScan && cancelledLaunches == 0
+            && cancelled.automaticScanner.totalCount == 0 && cancelled.notice.contains("中止"),
+            "success racing cancellation never creates a queue or false completion")
+        cancelled.startAutomaticScan()
+        cancellationJobs[0].replay(.ready)
+        try expect(cancelled.preparingAutomaticScan && cancellationJobs.count == 2 && cancelledLaunches == 0,
+            "an old callback cannot finish or launch the new preparation generation")
+        cancellationJobs[1].finish(.failed)
+        try expect(!cancelled.preparingAutomaticScan && cancelled.notice.contains("再試行")
+            && cancelled.automaticScanner.totalCount == 0, "preparation failure is visible and retryable without fake scan results")
+        cancelled.startAutomaticScan()
+        cancellationJobs[2].finish(.ready)
+        try expect(cancellationJobs.count == 3 && cancelledLaunches == 1,
+            "cancelled and failed preparations are not cached and a later success starts once")
+        cancelled.automaticScanner.shutdown()
+
+        let sync = DeskModel(directory: root.appendingPathComponent("preparation-synchronous"),
+            initialEntries: [entries[0]], refreshOnLaunch: false)
+        sync.prepareOCR = { _, completion in
+            let job = FakeOCRPreparation(completion); job.finish(.failed); return job
+        }
+        sync.startAutomaticScan()
+        try expect(!sync.preparingAutomaticScan && sync.automaticScanner.totalCount == 0 && sync.notice.contains("再試行"),
+            "synchronous launch failure does not leave a stale preparation token or handle")
+
+        let closing = DeskModel(directory: root.appendingPathComponent("preparation-shutdown"),
+            initialEntries: [entries[0]], refreshOnLaunch: false)
+        var closingJob: FakeOCRPreparation?
+        closing.prepareOCR = { _, completion in let job = FakeOCRPreparation(completion); closingJob = job; return job }
+        var shutdownFinished = false
+        closing.startAutomaticScan()
+        closing.shutdown { shutdownFinished = true }
+        try expect(!shutdownFinished && closingJob?.cancellations == 1,
+            "application shutdown waits for its owned preparation child to exit")
+        closingJob?.finish(.ready)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+        closing.startAutomaticScan()
+        closingJob?.replay(.ready)
+        try expect(shutdownFinished && closing.automaticScanner.totalCount == 0 && !closing.preparingAutomaticScan,
+            "shutdown and a late ready callback cannot launch or orphan preparation work")
+
+        let resumeDirectory = root.appendingPathComponent("preparation-resume")
+        var run = AutoScanRun(tasks: [AutoScanTask(entry: entries[0])])
+        run.resume(); run.pause()
+        try AutoScanStore(directory: resumeDirectory.appendingPathComponent("Automatic Scan/worker-0")).save(run)
+        let resumed = DeskModel(directory: resumeDirectory, initialEntries: [entries[0]], refreshOnLaunch: false)
+        var resumeJobs: [FakeOCRPreparation] = []
+        resumed.prepareOCR = { _, completion in let job = FakeOCRPreparation(completion); resumeJobs.append(job); return job }
+        var resumeLaunches = 0
+        resumed.automaticScanner.launch = { _ in resumeLaunches += 1; return nil }
+        resumed.resumeAutomaticScan()
+        try expect(resumed.preparingAutomaticScan && resumeLaunches == 0 && resumed.automaticScanner.canResume,
+            "a saved queue remains paused until a new app lifetime finishes preparation")
+        resumeJobs[0].finish(.failed)
+        try expect(resumed.automaticScanner.canResume && resumed.automaticScanner.completedCount == 0,
+            "failed resume preparation preserves all saved pending work")
+        resumed.resumeAutomaticScan()
+        resumeJobs[1].finish(.ready)
+        try expect(resumeLaunches == 1 && !resumed.preparingAutomaticScan,
+            "successful preparation resumes the saved queue once")
+        resumed.automaticScanner.shutdown()
+    }
+
+    static func scannerMetadataFixtures(_ root: URL, entry: Entry, process: Process) throws {
+        let support = root.appendingPathComponent("scan-metadata-fixtures")
+        let directory = support.appendingPathComponent("session")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let model = DeskModel(directory: support, initialEntries: [entry], refreshOnLaunch: false)
+        // Exact quarter-second fixtures avoid unrelated Date epoch-rounding
+        // differences when the host's Unix timestamp passes through JSON.
+        let started = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 2)
+        let id = UUID()
+        func freshSession() -> HostSession {
+            HostSession(id: id, entry: entry, process: process, directory: directory, started: started,
+                lifecycle: SessionLifecycle(name: entry.name, startedAt: started))
+        }
+        func heartbeat(_ value: Double) throws {
+            try JSONSerialization.data(withJSONObject: ["timestamp": value])
+                .write(to: directory.appendingPathComponent("heartbeat.json"), options: .atomic)
+        }
+        model.sessions = [freshSession()]
+        let firstReady = started.addingTimeInterval(0.25)
+        let firstBeat = floor(Date().timeIntervalSince1970)
+        var report: [String: Any] = ["state": "loading", "name": entry.name,
+            "readyAt": firstReady.timeIntervalSince1970, "phase": "error", "lastActivePhase": "creating_instance"]
+        try heartbeat(firstBeat)
+        try write(report, to: directory)
+        model.poll()
+        let initial = model.automaticScanner.observe(id)
+        try expect(initial?.readyAt == firstReady && initial?.heartbeatAt == Date(timeIntervalSince1970: firstBeat),
+            "host readiness and heartbeat timestamps reach the real scanner adapter without using poll time")
+        try expect(initial?.phase == "creating_instance" && initial?.needsActivation == false && model.currentRecords.isEmpty,
+            "last active phase is retained without converting diagnostic metadata into license evidence")
+
+        var publications = 0
+        let subscription = model.$sessions.dropFirst().sink { _ in publications += 1 }
+        defer { subscription.cancel() }
+        try heartbeat(firstBeat + 0.25)
+        model.poll()
+        try expect(publications > 0 && model.automaticScanner.observe(id)?.heartbeatAt == Date(timeIntervalSince1970: firstBeat + 0.25),
+            "heartbeat-only changes are published to the scanner instead of discarded by session equality")
+        report["lastActivePhase"] = "creating_editor"
+        report["failureReason"] = "instance_creation_failed"
+        report["terminationReason"] = "scan_time_limit"
+        report["probeDiagnostic"] = "ocr_time_budget_exceeded"
+        report["readyAt"] = firstReady.addingTimeInterval(1).timeIntervalSince1970
+        try write(report, to: directory); model.poll()
+        let updated = model.automaticScanner.observe(id)
+        try expect(updated?.phase == "creating_editor" && updated?.failureReason == "instance_creation_failed"
+            && updated?.terminationReason == "scan_time_limit" && updated?.probeDiagnostic == "ocr_time_budget_exceeded",
+            "phase and fixed failure/termination diagnostics survive poll and scanner observation")
+        try expect(updated?.readyAt == firstReady, "later host reports never slide the initial readiness window")
+
+        report["lastActivePhase"] = "/not/a/fixed/code"
+        report["failureReason"] = String(repeating: "x", count: 65)
+        report["terminationReason"] = "arbitrary raw error text"
+        report["probeDiagnostic"] = "raw OCR text must not be a diagnostic"
+        try write(report, to: directory); model.poll()
+        let rejected = model.automaticScanner.observe(id)
+        try expect(rejected?.phase == "creating_editor" && rejected?.failureReason == "instance_creation_failed"
+            && rejected?.terminationReason == "scan_time_limit" && rejected?.probeDiagnostic == "ocr_time_budget_exceeded",
+            "raw text and oversized diagnostics do not replace the bounded fixed-code fields")
+        report["probeDiagnostic"] = "ocr_no_supported_status"
+        try write(report, to: directory); model.poll()
+        try expect(model.automaticScanner.observe(id)?.probeDiagnostic == "ocr_no_supported_status",
+            "OCR-only diagnostic changes are published without waiting for a lifecycle or heartbeat change")
+        for invalidBeat in [started.timeIntervalSince1970 - 10, Date().timeIntervalSince1970 + 60] {
+            try heartbeat(invalidBeat); model.poll()
+            try expect(model.automaticScanner.observe(id)?.heartbeatAt == updated?.heartbeatAt,
+                "stale or far-future heartbeat cannot refresh the scanner's progress timestamp")
+        }
+        try FileManager.default.removeItem(at: directory.appendingPathComponent("heartbeat.json"))
+        for invalidReady in [started.timeIntervalSince1970 - 10, Date().timeIntervalSince1970 + 60, "invalid"] as [Any] {
+            model.sessions = [freshSession()]
+            try write(["state": "loading", "readyAt": invalidReady], to: directory); model.poll()
+            try expect(model.automaticScanner.observe(id)?.readyAt == nil,
+                "invalid host readiness is not accepted while the plug-in is still loading")
+        }
+        model.sessions = [freshSession()]
+        try write(["state": "loading", "readyAt": started.addingTimeInterval(-0.25).timeIntervalSince1970], to: directory)
+        model.poll()
+        try expect(model.automaticScanner.observe(id)?.readyAt == started,
+            "a valid near-start host timestamp is clamped to session start so the scanner can observe readiness")
+        try expect(model.currentRecords.isEmpty && model.unactivated.isEmpty,
+            "ready, heartbeat, phase and errors never manufacture an activation verdict")
+    }
+
     static func run() throws {
         let root = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
         try inventoryCacheFixtures(root)
@@ -141,6 +383,7 @@ enum FixtureFailure: Error, CustomStringConvertible {
         let unknown = try bundle(root, name: "Unknown", format: "VST3")
         let au = try bundle(root, name: "BundleA_AU", format: "AU")
         try expect(!a.metadataStamp.isEmpty && a.architectures == ["arm64"], "real fixture binary stamp and architecture")
+        try requestFixtures(a)
 
         let seed = try LicenseStore(directory: support)
         try seed.upsert(LicenseRecord(entryID: a.id, metadataStamp: "older-binary",
@@ -160,6 +403,7 @@ enum FixtureFailure: Error, CustomStringConvertible {
             if process.isRunning { process.terminate() }
             process.waitUntilExit()
         }
+        try scannerMetadataFixtures(root, entry: a, process: process)
         let started = Date().addingTimeInterval(-0.5)
         let observed = Date().timeIntervalSince1970
         let cacheFailureSupport = root.appendingPathComponent("cache-write-failure")
@@ -435,6 +679,9 @@ enum FixtureFailure: Error, CustomStringConvertible {
 
         let wholeInventory = DeskModel(directory: root.appendingPathComponent("whole-inventory"),
             initialEntries: [updated, unknown, au], refreshOnLaunch: false)
+        wholeInventory.prepareOCR = { _, completion in
+            let job = FakeOCRPreparation(completion); job.finish(.ready); return job
+        }
         var launchAttempts = 0
         wholeInventory.automaticScanner.launch = { _ in launchAttempts += 1; return nil }
         wholeInventory.query = "does-not-match-any-product"
@@ -459,6 +706,7 @@ enum FixtureFailure: Error, CustomStringConvertible {
         wholeInventory.sessions = [pendingFinal]
         try expect(wholeInventory.automaticScanner.observe(pendingFinal.id)?.isRunning == false,
             "automatic adapter releases slot only after lifecycle completion")
+        try preparationFixtures(root, entries: [updated, unknown, au])
         print("PASS: \(checks) DeskModel integration checks (poll, evidence, filters, queue, persistence, conflicts, binary identity)")
     }
 }

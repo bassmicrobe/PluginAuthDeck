@@ -4,16 +4,25 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_extra/juce_gui_extra.h>
 
+namespace
+{
+void recordFixtureEvent(const char* event)
+{
+    const auto path = juce::SystemStats::getEnvironmentVariable("PAD_FIXTURE_EVENT_LOG", "");
+    if (juce::File::isAbsolutePath(path)) juce::File(path).appendText(juce::String(event) + "\n");
+}
+}
+
 class FixtureProcessor final : public juce::AudioProcessor
 {
 public:
     FixtureProcessor() : AudioProcessor(BusesProperties()
         .withInput("Input", juce::AudioChannelSet::stereo(), true)
-        .withOutput("Output", juce::AudioChannelSet::stereo(), true)) {}
+        .withOutput("Output", juce::AudioChannelSet::stereo(), true)) { recordFixtureEvent("processor_created"); }
     const juce::String getName() const override { return "Plugin Auth Desk Fixture"; }
-    void prepareToPlay(double, int) override {}
+    void prepareToPlay(double, int) override { recordFixtureEvent("audio_prepared"); }
     void releaseResources() override {}
-    void processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) override { buffer.clear(); }
+    void processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) override { recordFixtureEvent("audio_processed"); buffer.clear(); }
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return false; }
     double getTailLengthSeconds() const override { return 0; }
@@ -33,19 +42,31 @@ class FixtureEditor final : public juce::AudioProcessorEditor, private juce::Tim
 public:
     explicit FixtureEditor(FixtureProcessor& processor) : AudioProcessorEditor(processor)
     {
+        recordFixtureEvent("editor_created");
+        paintedOnly = juce::SystemStats::getEnvironmentVariable("PAD_FIXTURE_PAINTED", "0") == "1";
         const int delay = juce::jlimit(0, 15000, juce::SystemStats::getEnvironmentVariable("PAD_FIXTURE_DELAY_MS", "0").getIntValue());
         const auto clearPath = juce::SystemStats::getEnvironmentVariable("PAD_FIXTURE_CLEAR_REQUEST", "");
         if (juce::File::isAbsolutePath(clearPath)) clearRequest = juce::File(clearPath);
         showAt = juce::Time::getMillisecondCounterHiRes() + delay;
         shown = delay == 0;
-        label.setText(shown ? statusText : "Fixture status pending", juce::dontSendNotification);
+        displayedText = shown ? statusText : "Fixture status pending";
+        label.setText(displayedText, juce::dontSendNotification);
         label.setEditable(false, false, false);
         label.setJustificationType(juce::Justification::centred);
-        addAndMakeVisible(label);
-        setSize(640, 140);
+        if (!paintedOnly) addAndMakeVisible(label);
+        else setAccessible(false); // No text node: the host must read painted pixels.
+        setSize(paintedOnly ? 1080 : 640, paintedOnly ? 200 : 140);
         if (!shown || clearRequest != juce::File()) startTimer(100);
     }
     void resized() override { label.setBounds(getLocalBounds().reduced(16)); }
+    void paint(juce::Graphics& graphics) override
+    {
+        if (!paintedOnly) return;
+        graphics.fillAll(juce::Colours::white);
+        graphics.setColour(juce::Colours::black);
+        graphics.setFont(juce::FontOptions(24.0f));
+        graphics.drawText(displayedText, getLocalBounds().reduced(20), juce::Justification::centred, false);
+    }
 private:
     void timerCallback() override
     {
@@ -53,14 +74,18 @@ private:
         // is a fixture-only control signal, never a vendor/user license file.
         if (clearRequest != juce::File() && clearRequest.existsAsFile())
         {
-            label.setText("Fixture status cleared", juce::dontSendNotification);
+            displayedText = "Fixture status cleared";
+            label.setText(displayedText, juce::dontSendNotification);
+            repaint();
             stopTimer();
             return;
         }
         if (!shown && juce::Time::getMillisecondCounterHiRes() >= showAt)
         {
             shown = true;
-            label.setText(statusText, juce::dontSendNotification);
+            displayedText = statusText;
+            label.setText(displayedText, juce::dontSendNotification);
+            repaint();
             if (clearRequest == juce::File()) stopTimer();
         }
     }
@@ -68,6 +93,8 @@ private:
     juce::File clearRequest;
     double showAt = 0.0;
     bool shown = false;
+    bool paintedOnly = false;
+    juce::String displayedText;
     juce::Label label;
 };
 

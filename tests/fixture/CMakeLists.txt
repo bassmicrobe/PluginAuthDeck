@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.22)
 project(PluginAuthDeskFixture VERSION 1.0.0)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_OSX_DEPLOYMENT_TARGET 12.0)
-set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "" FORCE)
+set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "" FORCE)
 add_subdirectory(../../JUCE ${CMAKE_BINARY_DIR}/JUCE EXCLUDE_FROM_ALL)
 juce_add_plugin(AuthDetectionFixture
     COMPANY_NAME "Plugin Auth Desk Test"

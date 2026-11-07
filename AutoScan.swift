@@ -13,20 +13,30 @@ struct AutoScanTask: Codable, Identifiable, Equatable {
     var entry: Entry
     var classID: String
     var productName: String
+    // Missing in v1.3.3 checkpoints. Keep the first failed attempt with this
+    // exact product while counting only the final result as a completed item.
+    var previousAttempts: [AutoScanAttempt]?
+
+    var isRetry: Bool { !(previousAttempts ?? []).isEmpty }
+    var launchBudgetSeconds: TimeInterval { isRetry ? 60 : 25 }
 
     var id: String {
         [entry.id, entry.metadataStamp, classID].map { "\($0.utf8.count):\($0)" }.joined()
     }
 
-    init(entry: Entry, classID: String = "", productName: String? = nil) {
+    init(entry: Entry, classID: String = "", productName: String? = nil,
+         previousAttempts: [AutoScanAttempt]? = nil) {
         self.entry = entry
         self.classID = classID
         self.productName = productName ?? entry.name
+        self.previousAttempts = previousAttempts
     }
 
     fileprivate var isValid: Bool {
         !entry.id.isEmpty && !entry.path.isEmpty && ["VST3", "AU"].contains(entry.format)
             && !productName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && (previousAttempts ?? []).count <= 1
+            && (previousAttempts ?? []).allSatisfy(\.isValid)
     }
 }
 
@@ -42,6 +52,18 @@ enum AutoScanOutcome: String, Codable, CaseIterable {
         case .changed: return "変更あり"
         case .skipped: return "スキップ"
         }
+    }
+}
+
+struct AutoScanAttempt: Codable, Equatable {
+    var outcome: AutoScanOutcome
+    var reason: String
+    var checkedAt: Date
+
+    fileprivate var isValid: Bool {
+        [.loadFailed, .timedOut].contains(outcome) && checkedAt.timeIntervalSince1970.isFinite
+            && !reason.isEmpty && reason.utf8.count <= 128
+            && reason.utf8.allSatisfy { (97...122).contains($0) || (48...57).contains($0) || $0 == 95 }
     }
 }
 
@@ -111,6 +133,10 @@ struct AutoScanRun: Codable, Equatable, Identifiable {
 
     var completedCount: Int { results.count }
     var totalCount: Int { pending.count + results.count + (current == nil ? 0 : 1) }
+    // Finish ordinary work before the bounded retry pass, including classes
+    // discovered by a retry. Identity never includes the attempt number.
+    var nextTask: AutoScanTask? { pending.first { !$0.isRetry } ?? pending.first }
+    var hasOrdinaryPending: Bool { pending.contains { !$0.isRetry } }
 
     init(tasks: [AutoScanTask], startedAt: Date = Date(), id: UUID = UUID()) {
         self.id = id
@@ -147,7 +173,8 @@ struct AutoScanRun: Codable, Equatable, Identifiable {
             updatedAt = canonicalScanDate()
             return nil
         }
-        current = pending.removeFirst()
+        let index = pending.firstIndex { !$0.isRetry } ?? pending.startIndex
+        current = pending.remove(at: index)
         updatedAt = canonicalScanDate()
         return current
     }
@@ -155,7 +182,8 @@ struct AutoScanRun: Codable, Equatable, Identifiable {
     mutating func identifyCurrent(classID: String, productName: String, siblings: [AutoScanTask] = []) throws {
         guard let original = current else { throw AutoScanError.noCurrentTask }
         guard !classID.isEmpty, original.classID.isEmpty || original.classID == classID else { throw AutoScanError.wrongClass }
-        let identified = AutoScanTask(entry: original.entry, classID: classID, productName: productName)
+        let identified = AutoScanTask(entry: original.entry, classID: classID, productName: productName,
+                                     previousAttempts: original.previousAttempts)
         guard identified.isValid else { throw AutoScanError.invalidState }
         guard !results.contains(where: { $0.id == identified.id }) else { throw AutoScanError.alreadyCompleted }
         // Validate the entire batch before changing anything, so a bad sibling
@@ -182,6 +210,25 @@ struct AutoScanRun: Codable, Equatable, Identifiable {
         current = nil
         if pending.isEmpty { status = .complete }
         updatedAt = canonicalScanDate()
+    }
+
+    // Called only after the owned host has actually exited. Pauses, ownership
+    // failures and storage conflicts must not consume a retry or create a result.
+    @discardableResult
+    mutating func retryCurrent(outcome: AutoScanOutcome, reason: String, checkedAt: Date = Date()) throws -> Bool {
+        guard var task = current else { throw AutoScanError.noCurrentTask }
+        guard !task.isRetry, [.loadFailed, .timedOut].contains(outcome) else { return false }
+        let attempt = AutoScanAttempt(outcome: outcome, reason: reason, checkedAt: canonicalScanDate(checkedAt))
+        guard attempt.isValid else { throw AutoScanError.invalidState }
+        task.previousAttempts = [attempt]
+        guard !pending.contains(where: { $0.id == task.id }), !results.contains(where: { $0.id == task.id }) else {
+            throw AutoScanError.alreadyCompleted
+        }
+        pending.append(task)
+        current = nil
+        status = .running
+        updatedAt = canonicalScanDate()
+        return true
     }
 
     // Reload is always a safe point: a process from the previous app lifetime is

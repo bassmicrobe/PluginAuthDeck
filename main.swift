@@ -55,10 +55,117 @@ struct HostSession: Identifiable {
     var products: [ScanProduct] = []
     var readyAt: Date?
     var candidate: ScanCandidate?
+    var heartbeatAt: Date?
+    var probeDiagnostic = ""
+    var phase = ""
+    var failureReason = ""
+    var terminationReason = ""
     var state: String { lifecycle.state }
     var message: String { lifecycle.message }
     var stopping: Bool { lifecycle.stopping }
     var isRunning: Bool { lifecycle.isRunning }
+}
+
+enum OCRPreparationOutcome { case ready, failed, cancelled }
+
+protocol OCRPreparationTask: AnyObject {
+    var isRunning: Bool { get }
+    func cancel()
+}
+
+/// Retains one preparation child until exit. It receives no plug-in or user
+/// content; the helper recognizes its own fixed synthetic image in memory.
+final class OCRPreparationProcess: OCRPreparationTask {
+    private let process = Process()
+    private let output = Pipe()
+    private let completion: (OCRPreparationOutcome) -> Void
+    private var timer: Timer?
+    private var response = Data()
+    private var eof = false
+    private var finished = false
+    private var launched = false
+    private var forcedOutcome: OCRPreparationOutcome?
+    private let deadline = ProcessInfo.processInfo.systemUptime + 65
+    var isRunning: Bool { launched && process.isRunning }
+
+    static func validResponse(_ data: Data) -> Bool {
+        guard !data.isEmpty, data.count <= 4096,
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], object.count == 2,
+              let version = object["version"] as? NSNumber,
+              CFGetTypeID(version) != CFBooleanGetTypeID(), version.doubleValue == 1,
+              let ready = object["ready"] as? NSNumber,
+              CFGetTypeID(ready) == CFBooleanGetTypeID(), ready.boolValue else { return false }
+        return true
+    }
+
+    init(helper: URL, completion: @escaping (OCRPreparationOutcome) -> Void) {
+        self.completion = completion
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/arch")
+        process.arguments = ["-arm64", helper.path, "--ocr-warmup", String(ProcessInfo.processInfo.processIdentifier)]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        process.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async { self?.poll() }
+        }
+        let descriptor = output.fileHandleForReading.fileDescriptor
+        guard helper.isFileURL, FileManager.default.isExecutableFile(atPath: helper.path),
+              fcntl(descriptor, F_SETFL, O_NONBLOCK) == 0 else { finish(.failed); return }
+        do {
+            try process.run()
+            launched = true
+            try? output.fileHandleForWriting.close()
+            timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.poll() }
+        } catch { finish(.failed) }
+    }
+
+    func cancel() { stop(with: .cancelled) }
+
+    private func stop(with outcome: OCRPreparationOutcome) {
+        guard !finished, forcedOutcome == nil else { return }
+        forcedOutcome = outcome
+        guard isRunning else { poll(); return }
+        process.terminate()
+        // The retained Process, never a saved PID, is the only signal target.
+        let child = process
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            if child.isRunning { Darwin.kill(child.processIdentifier, SIGKILL) }
+        }
+    }
+
+    private func poll() {
+        guard !finished else { return }
+        if !eof {
+            var buffer = [UInt8](repeating: 0, count: 512)
+            while response.count <= 4096 {
+                let count = Darwin.read(output.fileHandleForReading.fileDescriptor, &buffer, buffer.count)
+                if count > 0 { response.append(contentsOf: buffer.prefix(count)) }
+                else if count == 0 { eof = true; break }
+                else if errno == EINTR { continue }
+                else if errno == EAGAIN { break }
+                else { stop(with: .failed); break }
+            }
+            if response.count > 4096 { stop(with: .failed) }
+        }
+        if isRunning {
+            if ProcessInfo.processInfo.systemUptime >= deadline { stop(with: .failed) }
+            return
+        }
+        let valid = launched && process.terminationReason == .exit && process.terminationStatus == 0
+            && eof && Self.validResponse(response)
+        finish(forcedOutcome ?? (valid ? .ready : .failed))
+    }
+
+    private func finish(_ outcome: OCRPreparationOutcome) {
+        guard !finished, !isRunning else { return }
+        finished = true
+        timer?.invalidate(); timer = nil
+        process.terminationHandler = nil
+        try? output.fileHandleForReading.close()
+        try? output.fileHandleForWriting.close()
+        response.removeAll(keepingCapacity: false)
+        completion(outcome)
+    }
 }
 
 final class DeskModel: ObservableObject {
@@ -81,6 +188,16 @@ final class DeskModel: ObservableObject {
     @Published var inventoryError = ""
     @Published var unconfirmedOnly = false
     @Published var workflow: ActivationWorkflow?
+    @Published private(set) var preparingAutomaticScan = false
+    @Published private(set) var stoppingAutomaticPreparation = false
+    var prepareOCR: (URL, @escaping (OCRPreparationOutcome) -> Void) -> OCRPreparationTask = {
+        OCRPreparationProcess(helper: $0, completion: $1)
+    }
+    private enum PreparedScanAction { case start, resume }
+    private var preparationTask: OCRPreparationTask?
+    private var preparationToken: UUID?
+    private var preparationAction: PreparedScanAction?
+    private var ocrPrepared = false
     private let supportDirectory: URL
     private var licenseStore: LicenseStore?
     private var entryIndex: [String: Entry] = [:]
@@ -91,7 +208,10 @@ final class DeskModel: ObservableObject {
     lazy var automaticScanner: AutomaticScanner = {
         let scanner = AutomaticScanner(directory: supportDirectory.appendingPathComponent("Automatic Scan"),
                                        automaticallyTick: backgroundTimersEnabled)
-        scanner.launch = { [weak self] task in self?.open(task.entry, classID: task.classID, automatic: true) }
+        scanner.launch = { [weak self] task in
+            self?.open(task.entry, classID: task.classID, automatic: true,
+                       scanBudgetSeconds: task.launchBudgetSeconds)
+        }
         scanner.stop = { [weak self] id in self?.stop(id) }
         scanner.observe = { [weak self] id in
             guard let self = self, let session = self.sessions.first(where: { $0.id == id }) else { return nil }
@@ -100,7 +220,10 @@ final class DeskModel: ObservableObject {
                 state: session.state, classID: session.classID, productName: session.lifecycle.displayName,
                 classes: session.products, startedAt: session.started, readyAt: session.readyAt,
                 needsActivation: license?.status == .needsActivation,
-                evidenceRule: license?.evidenceRule ?? "user_confirmed", candidate: session.candidate)
+                evidenceRule: license?.evidenceRule ?? "user_confirmed", candidate: session.candidate,
+                heartbeatAt: session.heartbeatAt, phase: session.phase,
+                failureReason: session.failureReason, terminationReason: session.terminationReason,
+                probeDiagnostic: session.probeDiagnostic)
         }
         scanner.isKnown = { [weak self] task in
             self?.records(for: task.entry).contains { $0.classID == task.classID } ?? false
@@ -188,7 +311,7 @@ final class DeskModel: ObservableObject {
     var activeCount: Int { sessions.filter { $0.isRunning }.count }
 
     func refresh() {
-        guard !scanning else { return }
+        guard !scanning, !preparingAutomaticScan, !isShuttingDown else { return }
         scanning = true
         DispatchQueue.global(qos: .utility).async {
             let start = Date()
@@ -220,6 +343,7 @@ final class DeskModel: ObservableObject {
     }
 
     func openManager(_ e: Entry) {
+        guard !preparingAutomaticScan, !isShuttingDown else { notice = "自動チェックを準備中です。中止してから開いてください。"; return }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: e.path), configuration: configuration) { _, error in
@@ -235,8 +359,19 @@ final class DeskModel: ObservableObject {
         }
     }
 
-    @discardableResult func open(_ e: Entry, classID: String = "", forWorkflow: Bool = false, automatic: Bool = false) -> UUID? {
+    static func hostRequest(entry: Entry, classID: String, automatic: Bool,
+                            scanBudgetSeconds: TimeInterval, parentPID: Int32) -> [String: Any] {
+        var payload: [String: Any] = ["name": entry.name, "format": entry.format,
+            "identifier": entry.identifier, "path": entry.path, "classID": classID,
+            "mode": automatic ? "scan" : "manual", "parentPID": parentPID]
+        if automatic { payload["scanDeadlineSeconds"] = scanBudgetSeconds == 60 ? 70 : 35 }
+        return payload
+    }
+
+    @discardableResult func open(_ e: Entry, classID: String = "", forWorkflow: Bool = false, automatic: Bool = false,
+                                scanBudgetSeconds: TimeInterval = 25) -> UUID? {
         notice = ""
+        guard !preparingAutomaticScan, !isShuttingDown else { notice = "自動チェックを準備中です。中止してから開いてください。"; return nil }
         if e.format == "APP" { openManager(e); return nil }
         guard !automaticScanner.isBusy || automatic else { notice = "自動チェック中です。プラグインを操作する場合は一時停止してください。"; return nil }
         guard workflow == nil || forWorkflow else { notice = "順番に確認中です。続けるか「中断」で終了してください。"; return nil }
@@ -270,9 +405,9 @@ final class DeskModel: ObservableObject {
         }
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            let data = try JSONSerialization.data(withJSONObject: ["name": e.name, "format": e.format,
-                "identifier": e.identifier, "path": e.path, "classID": classID,
-                "mode": automatic ? "scan" : "manual", "parentPID": ProcessInfo.processInfo.processIdentifier])
+            let payload = Self.hostRequest(entry: e, classID: classID, automatic: automatic,
+                scanBudgetSeconds: scanBudgetSeconds, parentPID: ProcessInfo.processInfo.processIdentifier)
+            let data = try JSONSerialization.data(withJSONObject: payload)
             try data.write(to: request, options: .atomic)
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/arch")
@@ -298,8 +433,8 @@ final class DeskModel: ObservableObject {
                     if self.activeCount == 0 { self.timer?.invalidate(); self.timer = nil }
                 }
             }
-            try p.run()
             let started = Date()
+            try p.run()
             sessions.append(HostSession(id: id, entry: launchEntry, process: p, directory: directory, started: started,
                                         lifecycle: SessionLifecycle(name: e.name, startedAt: started)))
             startPolling()
@@ -323,10 +458,14 @@ final class DeskModel: ObservableObject {
             let heartbeatURL = s.directory.appendingPathComponent("heartbeat.json")
             let beat = HostReportReader.object(at: heartbeatURL, maximumBytes: HostReportReader.heartbeatLimit)
             let heartbeat = (beat?["timestamp"] as? Double).map(Date.init(timeIntervalSince1970:))
+            if let heartbeat, heartbeat.timeIntervalSince1970.isFinite,
+               heartbeat >= s.started.addingTimeInterval(-1), heartbeat <= Date().addingTimeInterval(5) {
+                updated[i].heartbeatAt = heartbeat
+            }
             updated[i].lifecycle.receive(report, heartbeat: heartbeat)
             catalogChanged = receiveHostMetadata(report, session: &updated[i]) || catalogChanged
         }
-        if zip(sessions, updated).contains(where: { $0.lifecycle != $1.lifecycle || $0.knownClasses != $1.knownClasses || $0.classID != $1.classID || $0.evidenceObservedAt != $1.evidenceObservedAt || $0.products != $1.products || $0.readyAt != $1.readyAt || $0.candidate != $1.candidate }) {
+        if zip(sessions, updated).contains(where: { $0.lifecycle != $1.lifecycle || $0.knownClasses != $1.knownClasses || $0.classID != $1.classID || $0.evidenceObservedAt != $1.evidenceObservedAt || $0.products != $1.products || $0.readyAt != $1.readyAt || $0.candidate != $1.candidate || $0.heartbeatAt != $1.heartbeatAt || $0.phase != $1.phase || $0.failureReason != $1.failureReason || $0.terminationReason != $1.terminationReason || $0.probeDiagnostic != $1.probeDiagnostic }) {
             sessions = updated
         }
         if catalogChanged { saveInventoryCache() }
@@ -335,6 +474,17 @@ final class DeskModel: ObservableObject {
     private func receiveHostMetadata(_ report: [String: Any], session: inout HostSession) -> Bool {
         var catalogChanged = false
         var enumeratedIDs: [String]?
+        for (key, path) in [("lastActivePhase", \HostSession.phase), ("failureReason", \HostSession.failureReason),
+                            ("terminationReason", \HostSession.terminationReason), ("probeDiagnostic", \HostSession.probeDiagnostic)] {
+            if let code = report[key] as? String, code.utf8.count <= 64,
+               code.utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) || $0 == 95 }) {
+                session[keyPath: path] = code
+            }
+        }
+        if session.readyAt == nil, let ready = report["readyAt"] as? Double, ready.isFinite,
+           ready >= session.started.timeIntervalSince1970 - 1, ready <= Date().timeIntervalSince1970 + 5 {
+            session.readyAt = max(session.started, Date(timeIntervalSince1970: ready))
+        }
         if report["state"] as? String == "ready", session.readyAt == nil { session.readyAt = Date() }
         if let classID = report["classID"] as? String { session.classID = classID }
         // A first observation only extends the scan's bounded observation
@@ -497,19 +647,78 @@ final class DeskModel: ObservableObject {
     }
 
     func startAutomaticScan() {
-        guard workflow == nil, activeCount == 0, !scanning, licenseError.isEmpty else {
+        guard !preparingAutomaticScan, !isShuttingDown, !automaticScanner.isBusy else { return }
+        guard workflow == nil, activeCount == 0, !scanning, licenseError.isEmpty, automaticScanner.error.isEmpty else {
             notice = "一覧の更新と、開いているプラグインの終了を待ってから自動チェックを開始してください。"; return
         }
-        // Whole inventory, independent of search, favorites and format filters.
-        automaticScanner.start(tasks: entries.filter { needsReview($0) }.map { AutoScanTask(entry: $0) })
-        category = "未認証"; query = ""; favoritesOnly = false; format = "すべて"
+        guard entries.contains(where: { needsReview($0) }) else { notice = "自動チェックが必要な製品はありません。"; return }
+        prepareAutomaticScan(action: .start)
     }
 
     func resumeAutomaticScan() {
-        guard activeCount == 0, workflow == nil, licenseError.isEmpty else {
+        guard !preparingAutomaticScan, !isShuttingDown, automaticScanner.canResume else { return }
+        guard activeCount == 0, workflow == nil, !scanning, licenseError.isEmpty else {
             notice = "開いているプラグインを終了してから再開してください。"; return
         }
-        automaticScanner.resume()
+        prepareAutomaticScan(action: .resume)
+    }
+
+    private func prepareAutomaticScan(action: PreparedScanAction) {
+        if ocrPrepared { beginPreparedScan(action); return }
+        let token = UUID()
+        preparationToken = token
+        preparationAction = action
+        preparingAutomaticScan = true
+        stoppingAutomaticPreparation = false
+        notice = ""
+        let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/AuthPluginHost.app/Contents/MacOS/AuthPluginHost")
+        let task = prepareOCR(helper) { [weak self] outcome in
+            guard let self = self, self.preparationToken == token else { return }
+            let action = self.preparationAction
+            let cancelled = self.stoppingAutomaticPreparation
+            self.preparationTask = nil
+            self.preparationToken = nil
+            self.preparationAction = nil
+            self.preparingAutomaticScan = false
+            self.stoppingAutomaticPreparation = false
+            guard !self.isShuttingDown else { return }
+            guard !cancelled, let action, outcome != .cancelled else {
+                self.notice = "自動チェックの準備を中止しました。チェックは開始していません。"; return
+            }
+            guard outcome == .ready else {
+                self.notice = "自動チェックの準備が完了しませんでした。チェックは開始していません。もう一度実行して再試行できます。"; return
+            }
+            self.ocrPrepared = true // Only this DeskModel lifetime; never saved.
+            self.beginPreparedScan(action)
+        }
+        // Also safe for an injected adapter that completes synchronously.
+        if preparationToken == token { preparationTask = task }
+        else if task.isRunning { task.cancel() }
+    }
+
+    private func beginPreparedScan(_ action: PreparedScanAction) {
+        guard !isShuttingDown, !preparingAutomaticScan, workflow == nil, activeCount == 0,
+              !scanning, licenseError.isEmpty, !automaticScanner.isBusy else {
+            notice = "準備は完了しました。開いている作業が終了したら、もう一度自動チェックを実行してください。"; return
+        }
+        switch action {
+        case .start:
+            // Read the complete current inventory once preparation succeeds,
+            // independent of search, favorites and format filters.
+            let tasks = entries.filter { needsReview($0) }.map { AutoScanTask(entry: $0) }
+            guard !tasks.isEmpty else { notice = "自動チェックが必要な製品はありません。"; return }
+            automaticScanner.start(tasks: tasks)
+            category = "未認証"; query = ""; favoritesOnly = false; format = "すべて"
+        case .resume:
+            automaticScanner.resume()
+        }
+    }
+
+    func cancelAutomaticPreparation() {
+        guard preparingAutomaticScan, !stoppingAutomaticPreparation else { return }
+        preparationAction = nil // A late ready response must never start work.
+        stoppingAutomaticPreparation = true
+        preparationTask?.cancel()
     }
 
     func startReview() {
@@ -519,7 +728,8 @@ final class DeskModel: ObservableObject {
     }
 
     private func startWorkflow(mode: ActivationWorkflow.Mode, targets: [ActivationTarget]) {
-        guard workflow == nil, !targets.isEmpty, licenseStore != nil, !automaticScanner.isBusy else { return }
+        guard workflow == nil, !targets.isEmpty, licenseStore != nil, !automaticScanner.isBusy,
+              !preparingAutomaticScan, !isShuttingDown else { return }
         guard activeCount == 0 else { notice = "先に、開いているプラグインを終了してください。順番の確認では1件ずつ開きます。"; return }
         workflow = ActivationWorkflow(mode: mode, targets: targets)
         launchWorkflowItem()
@@ -584,16 +794,19 @@ final class DeskModel: ObservableObject {
     func shutdown(_ completion: @escaping () -> Void) {
         guard !isShuttingDown else { return }
         isShuttingDown = true
+        cancelAutomaticPreparation()
         automaticScanner.shutdown()
         workflow = nil
         timer?.invalidate()
         timer = nil
         let active = sessions.filter { $0.process.isRunning }
         active.forEach { stop($0.id) }
-        guard !active.isEmpty else { completion(); return }
         let deadline = Date().addingTimeInterval(4.5)
         func check() {
-            if active.allSatisfy({ !$0.process.isRunning }) || Date() >= deadline {
+            // Do not release the app while its warmup child is still stopping.
+            // The child also has its own watchdog and actual-parent check.
+            if (active.allSatisfy({ !$0.process.isRunning }) || Date() >= deadline)
+                && self.preparationTask?.isRunning != true {
                 completion()
             } else {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: check)
@@ -618,12 +831,16 @@ struct DeskView: View {
                 }
                 Spacer()
                 Label("音声出力なし", systemImage: "speaker.slash").font(.system(size: 12)).foregroundColor(.secondary)
-                Button(action: model.refresh) { Label("一覧を更新", systemImage: "arrow.clockwise") }.disabled(model.scanning)
+                Button(action: model.refresh) { Label("一覧を更新", systemImage: "arrow.clockwise") }
+                    .disabled(model.scanning || model.preparingAutomaticScan)
             }.padding(24)
             Divider()
             AutomaticScanPanel(scanner: model.automaticScanner,
                 start: model.startAutomaticScan, resume: model.resumeAutomaticScan,
-                mayStart: model.workflow == nil && model.activeCount == 0 && !model.scanning && model.licenseError.isEmpty)
+                cancelPreparation: model.cancelAutomaticPreparation,
+                preparing: model.preparingAutomaticScan, stoppingPreparation: model.stoppingAutomaticPreparation,
+                mayStart: model.workflow == nil && model.activeCount == 0 && !model.scanning
+                    && !model.preparingAutomaticScan && model.licenseError.isEmpty)
             Divider()
             HStack(spacing: 0) {
                 VStack(alignment: .leading, spacing: 12) {
@@ -657,11 +874,12 @@ struct DeskView: View {
                         Text("未認証の表示を検出した製品と、手動で未認証にした製品だけを表示します。")
                             .font(.system(size: 11)).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
                         Button("一覧を順番に認証（\(model.unactivated.count)件）", action: model.startActivation)
-                            .buttonStyle(.borderedProminent).disabled(model.unactivated.isEmpty || model.workflow != nil || !model.licenseError.isEmpty)
+                            .buttonStyle(.borderedProminent).disabled(model.unactivated.isEmpty || model.workflow != nil
+                                || model.preparingAutomaticScan || !model.licenseError.isEmpty)
                     } else if model.category == "プラグイン" {
                         Toggle("未確認を含む製品だけ", isOn: $model.unconfirmedOnly).font(.system(size: 11))
                         Button("表示中の未確認を順に開く", action: model.startReview)
-                            .disabled(model.filtered.isEmpty || model.workflow != nil || !model.licenseError.isEmpty)
+                            .disabled(model.filtered.isEmpty || model.workflow != nil || model.preparingAutomaticScan || !model.licenseError.isEmpty)
                     }
                     List(selection: $model.selection) {
                         if model.category == "未認証" {
@@ -675,7 +893,7 @@ struct DeskView: View {
                             ForEach(model.filtered) { entry in
                                 entryRow(entry, name: entry.name, caption: nil).tag(entry.id)
                                 .contextMenu {
-                                    Button("画面を開く") { model.open(entry) }
+                                    Button("画面を開く") { model.open(entry) }.disabled(model.preparingAutomaticScan)
                                     Button("お気に入りを切り替え") { model.toggleFavorite(entry) }
                                     Button("Finderで表示") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: entry.path)]) }
                                 }
@@ -889,6 +1107,7 @@ struct DeskView: View {
                 Text("メーカーの管理アプリを開きます。サインインやライセンスの有効化は、そのアプリで行ってください。")
                     .foregroundColor(.secondary).lineSpacing(5)
                 Button("認証アプリを開く") { model.open(e) }.buttonStyle(.borderedProminent).controlSize(.large)
+                    .disabled(model.preparingAutomaticScan)
             } else {
                 Text("プラグイン本体の画面を開きます。認証画面が自動で出ない場合は、Activate / Register / License などのメニューを選んでください。")
                     .foregroundColor(.secondary).lineSpacing(5)
@@ -897,9 +1116,10 @@ struct DeskView: View {
                 }.frame(maxWidth: 330).help("通常は自動。Intel専用プラグインはRosettaで開きます。")
                 HStack(spacing: 10) {
                     Button("プラグイン画面を開く") { model.open(e, classID: model.selectedRecord?.classID ?? "") }
-                        .buttonStyle(.borderedProminent).controlSize(.large).disabled(model.workflow != nil)
+                        .buttonStyle(.borderedProminent).controlSize(.large).disabled(model.workflow != nil || model.preparingAutomaticScan)
                     if let manager = model.managerFor(e) {
                         Button("メーカーアプリ") { model.openManager(manager) }.controlSize(.large).help(manager.name)
+                            .disabled(model.preparingAutomaticScan)
                     }
                 }
                 Text("音声・MIDIデバイスは接続しません。読み込みが止まった場合は、下の「終了」でこのプラグインだけを停止できます。")
@@ -934,13 +1154,21 @@ struct AutomaticScanPanel: View {
     @ObservedObject var scanner: AutomaticScanner
     let start: () -> Void
     let resume: () -> Void
+    let cancelPreparation: () -> Void
+    let preparing: Bool
+    let stoppingPreparation: Bool
     let mayStart: Bool
     var body: some View {
+        let counts = Dictionary(grouping: scanner.results, by: \.outcome).mapValues(\.count)
+        let retrying = scanner.runs.contains { $0.current?.isRetry == true }
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
                 Label("全プラグインの自動チェック", systemImage: "sparkle.magnifyingglass").font(.system(size: 13, weight: .semibold))
                 Spacer()
-                if scanner.isBusy {
+                if preparing {
+                    Button(stoppingPreparation ? "中止処理中…" : "準備を中止", action: cancelPreparation)
+                        .disabled(stoppingPreparation).accessibilityIdentifier("cancel-scan-preparation")
+                } else if scanner.isBusy {
                     Button(scanner.isStopping ? "停止処理中…" : "一時停止") { scanner.pause() }.disabled(scanner.isStopping)
                 } else if scanner.canResume {
                     Button("続きから再開", action: resume).buttonStyle(.borderedProminent).disabled(!mayStart)
@@ -954,13 +1182,20 @@ struct AutomaticScanPanel: View {
                     }
                 }
             }
-            if scanner.totalCount > 0 {
+            if preparing {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text(stoppingPreparation ? "自動チェックの準備を中止しています" : "自動チェックを準備中")
+                        .accessibilityIdentifier("scan-preparation-status")
+                }.font(.system(size: 12))
+            } else if scanner.totalCount > 0 {
                 HStack {
                     Text("\(scanner.completedCount) / \(scanner.totalCount) 件チェック済み")
-                    Text("未認証 \(scanner.unactivatedCount) 件 · 判定不可・読込失敗 \(scanner.inconclusiveCount) 件")
+                    Text("未認証検出 \(scanner.unactivatedCount) 件")
+                    Text("未判定 \(counts[.inconclusive, default: 0]) · 読込失敗 \(counts[.loadFailed, default: 0]) · 時間切れ \(counts[.timedOut, default: 0])")
                         .foregroundColor(.secondary)
                     Spacer()
-                    Text(scanner.isComplete ? "完了" : scanner.isStopping ? "停止中" : scanner.isRunning ? "実行中（最大2件）" : "一時停止")
+                    Text(scanner.isComplete ? "完了" : scanner.isStopping ? "停止中" : scanner.isRunning ? (retrying ? "再試行中（1件ずつ）" : "実行中（最大2件）") : "一時停止")
                 }.font(.system(size: 11))
                 ProgressView(value: Double(scanner.completedCount), total: Double(max(1, scanner.totalCount)))
                 if scanner.isRunning {
@@ -968,7 +1203,11 @@ struct AutomaticScanPanel: View {
                         .font(.system(size: 10)).foregroundColor(.secondary).lineLimit(1)
                 }
             }
-            if !scanner.error.isEmpty {
+            if preparing {
+                Text(stoppingPreparation ? "準備の終了を待っています。チェックは開始しません。"
+                    : "初回は1分ほどかかる場合があります。準備が終わるとチェックを開始します。")
+                    .font(.system(size: 11)).foregroundColor(.secondary)
+            } else if !scanner.error.isEmpty {
                 HStack {
                     Text(scanner.error).foregroundColor(.red).textSelection(.enabled)
                     Button("記録を再読み込み") { scanner.reload() }.disabled(scanner.hasActiveHosts)

@@ -21,8 +21,8 @@ import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parent
 BUNDLE_ID = 'local.plugin-auth-desk'
-VERSION = '1.3.3'
-BUILD_NUMBER = '7'
+VERSION = '1.4.0'
+BUILD_NUMBER = '8'
 JUCE_COMMIT = '72782788ce18c2d4d760b28e0921d6ffc6431102'
 JUCE_TREE = 'd23fca239ebee89df5e81718a2fe16434b53118b'
 # Explicit source distribution: never recursively add the project directory.
@@ -267,7 +267,10 @@ def build_app():
     shutil.copy2('JUCE/JUCE.spdx.json', contents/'Resources/JUCE.spdx.json')
     # Strip only signing-incompatible Finder metadata; preserve quarantine.
     run([sys.executable, ROOT/'scripts/signing_metadata.py', app])
-    run(['codesign', '--force', '--sign', '-', helper])
+    # Exercise the same host runtime restrictions as distribution builds, so
+    # development smoke tests also catch missing plug-in compatibility rights.
+    run(['codesign', '--force', '--sign', '-', '--options', 'runtime', '--timestamp=none',
+         '--entitlements', ROOT/'packaging/host-entitlements.plist', helper])
     run(['codesign', '--force', '--sign', '-', app])
     verify_app(app)
     return app

@@ -15,7 +15,7 @@ struct ScanCandidate: Equatable {
 
     init?(rule: String, observedAt: Date) {
         let allowed: Set<String> = ["product_not_activated", "product_not_registered", "unlicensed_status",
-                                    "license_expired", "trial_expired", "demo_mode", "no_valid_license"]
+                                    "license_expired", "trial_expired", "demo_mode", "no_valid_license", "activation_form"]
         guard allowed.contains(rule), observedAt.timeIntervalSince1970.isFinite,
               observedAt.timeIntervalSince1970 > 0 else { return nil }
         self.rule = rule
@@ -34,6 +34,11 @@ struct ScanObservation {
     var needsActivation: Bool
     var evidenceRule: String = ""
     var candidate: ScanCandidate? = nil
+    var heartbeatAt: Date? = nil
+    var phase: String = ""
+    var failureReason: String = ""
+    var terminationReason: String = ""
+    var probeDiagnostic: String = ""
 }
 
 /// The runner owns only session UUIDs retained by DeskModel, never saved PIDs.
@@ -41,10 +46,17 @@ struct ScanObservation {
 final class AutomaticScanner: ObservableObject {
     static let workerCount = 2
     static let startupLimit: TimeInterval = 25
-    static let readyObservationTime: TimeInterval = 4
+    static let readyObservationTime: TimeInterval = 6
     static let candidateObservationGrace: TimeInterval = 2.5
+    static let heartbeatFreshness: TimeInterval = 8
+    private static let failureReasons: Set<String> = ["unsupported_format", "enumeration_failed", "no_plugin_classes",
+        "requested_class_missing", "instance_creation_failed", "no_custom_editor", "invalid_request"]
+    private static let retryableFailureReasons: Set<String> = ["enumeration_failed", "no_plugin_classes", "instance_creation_failed"]
+    private static let inconclusiveProbeReasons: Set<String> = ["ocr_native_worker_failed", "ocr_native_worker_cleanup_failed",
+        "ocr_native_worker_protocol_error", "ocr_recognition_failed", "ocr_recognition_exception", "ocr_image_unavailable", "ocr_text_limit"]
 
-    static func observationDeadline(readyAt: Date, startedAt: Date, candidate: ScanCandidate?, now: Date) -> Date {
+    static func observationDeadline(readyAt: Date, startedAt: Date, candidate: ScanCandidate?, now: Date,
+                                    startupBudget: TimeInterval = startupLimit) -> Date {
         let baseline = readyAt.addingTimeInterval(readyObservationTime)
         var deadline = baseline
         if let candidate, candidate.observedAt >= startedAt, candidate.observedAt <= now {
@@ -53,7 +65,18 @@ final class AutomaticScanner: ObservableObject {
             deadline = max(baseline, min(candidate.observedAt.addingTimeInterval(candidateObservationGrace),
                                          baseline.addingTimeInterval(candidateObservationGrace)))
         }
-        return min(deadline, startedAt.addingTimeInterval(startupLimit))
+        // Loading immediately before its deadline still receives a complete
+        // observation window. The host watchdog leaves ten seconds for this
+        // window and shutdown; neither changing candidates nor heartbeats slide it.
+        return min(deadline, startedAt.addingTimeInterval(startupBudget + readyObservationTime + candidateObservationGrace))
+    }
+
+    private static func loadingTimeoutReason(_ observed: ScanObservation, now: Date) -> String {
+        let phase = ["enumerating", "creating_instance", "creating_editor"].contains(observed.phase)
+            ? observed.phase : "loading"
+        guard let beat = observed.heartbeatAt, beat.timeIntervalSince1970.isFinite,
+              beat >= observed.startedAt, beat <= now else { return phase + "_deadline_no_heartbeat" }
+        return phase + (now.timeIntervalSince(beat) <= heartbeatFreshness ? "_deadline_responsive" : "_heartbeat_stalled")
     }
 
     @Published private(set) var runs: [AutoScanRun] = []
@@ -76,9 +99,17 @@ final class AutomaticScanner: ObservableObject {
         var reason = ""
         var metadataKey = ""
         init(store: AutoScanStore) { self.store = store; run = store.run }
+        func clearSession() {
+            sessionID = nil
+            readyAt = nil
+            result = nil
+            reason = ""
+            metadataKey = ""
+        }
     }
     private let directory: URL
     private let automaticallyTick: Bool
+    private let automaticallyRetryFailures: Bool
     private var workers: [Worker] = []
     private var workspace: AutoScanWorkspace?
     private var timer: Timer?
@@ -101,9 +132,10 @@ final class AutomaticScanner: ObservableObject {
     var reportURL: URL { directory.appendingPathComponent("自動チェック結果.csv") }
     var checkpointDirectory: URL { workspace?.activeDirectory ?? directory }
 
-    init(directory: URL, automaticallyTick: Bool = true) {
+    init(directory: URL, automaticallyTick: Bool = true, automaticallyRetryFailures: Bool = true) {
         self.directory = directory
         self.automaticallyTick = automaticallyTick
+        self.automaticallyRetryFailures = automaticallyRetryFailures
         loadStores()
         if automaticallyTick {
             let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
@@ -260,40 +292,62 @@ final class AutomaticScanner: ObservableObject {
                     // Do not mark paused items completed. Retry this item on
                     // resume, after the previous process is definitely gone.
                     run.pause()
-                    worker.sessionID = nil
-                    worker.result = nil
-                    worker.readyAt = nil
-                    worker.metadataKey = ""
+                    worker.clearSession()
                     if error.isEmpty { _ = commit(run, worker: worker) }
                     else { worker.run = run; publish() }
                     continue
                 }
                 if observed.needsActivation { requestEnd(worker, outcome: .needsActivation, reason: observed.evidenceRule) }
                 if !observed.isRunning {
+                    let watchdogExpired = observed.terminationReason == "scan_time_limit"
                     let outcome = observed.needsActivation ? AutoScanOutcome.needsActivation : worker.result
-                        ?? (observed.state == "error" ? .loadFailed : .inconclusive)
-                    let reason = observed.needsActivation ? observed.evidenceRule : worker.reason.isEmpty ? "host_exited_without_license_evidence" : worker.reason
-                    do { try run.finishCurrent(outcome: outcome, reason: reason, checkedAt: now) }
+                        ?? (watchdogExpired ? .timedOut : observed.state == "error" ? .loadFailed : .inconclusive)
+                    let reason = observed.needsActivation ? observed.evidenceRule : worker.result != nil ? worker.reason
+                        : watchdogExpired ? "host_watchdog_time_limit"
+                        : Self.failureReasons.contains(observed.failureReason) ? observed.failureReason
+                        : observed.state == "error" ? "host_exited_with_error" : "host_exited_without_license_evidence"
+                    do {
+                        let retryable = outcome == .timedOut || (outcome == .loadFailed && Self.retryableFailureReasons.contains(reason))
+                        let retried = automaticallyRetryFailures && retryable
+                            ? try run.retryCurrent(outcome: outcome, reason: reason, checkedAt: now) : false
+                        if !retried { try run.finishCurrent(outcome: outcome, reason: reason, checkedAt: now) }
+                    }
                     catch { fail(error.localizedDescription); continue }
                     guard commit(run, worker: worker) else { continue }
-                    worker.sessionID = nil
-                    worker.result = nil
-                    worker.readyAt = nil
-                    worker.metadataKey = ""
+                    worker.clearSession()
                     continue
                 }
                 if worker.result != nil { continue } // Wait for actual exit.
-                if observed.state == "error" { requestEnd(worker, outcome: .loadFailed, reason: "plugin_load_error"); continue }
-                if let ready = observed.readyAt, worker.readyAt == nil { worker.readyAt = ready }
-                if now.timeIntervalSince(observed.startedAt) >= Self.startupLimit {
-                    requestEnd(worker, outcome: .timedOut, reason: "host_absolute_time_limit")
-                } else if let ready = worker.readyAt {
+                if observed.state == "error" {
+                    let reason = Self.failureReasons.contains(observed.failureReason) ? observed.failureReason : "plugin_load_error"
+                    requestEnd(worker, outcome: .loadFailed, reason: reason)
+                    continue
+                }
+                if let ready = observed.readyAt, worker.readyAt == nil, ready.timeIntervalSince1970.isFinite,
+                   ready >= observed.startedAt, ready <= now { worker.readyAt = ready }
+                let budget = run.current?.launchBudgetSeconds ?? Self.startupLimit
+                if let ready = worker.readyAt {
                     let candidate = observed.classID.isEmpty ? nil : observed.candidate
                     let deadline = Self.observationDeadline(readyAt: ready, startedAt: observed.startedAt,
-                                                            candidate: candidate, now: now)
+                                                            candidate: candidate, now: now, startupBudget: budget)
                     if now >= deadline {
-                        requestEnd(worker, outcome: .inconclusive, reason: "no_supported_explicit_license_status")
+                        if observed.probeDiagnostic == "ocr_time_budget_exceeded" {
+                            // A cold OCR engine can exceed its own budget while
+                            // the editor remains responsive. Preserve that
+                            // explicit timeout for the existing single retry;
+                            // missing/failed recognition is never a verdict.
+                            requestEnd(worker, outcome: .timedOut, reason: "ocr_time_budget_exceeded")
+                        } else if let beat = observed.heartbeatAt, beat >= observed.startedAt, beat <= now,
+                           now.timeIntervalSince(beat) > Self.heartbeatFreshness {
+                            requestEnd(worker, outcome: .timedOut, reason: "observing_heartbeat_stalled")
+                        } else {
+                            let reason = Self.inconclusiveProbeReasons.contains(observed.probeDiagnostic)
+                                ? observed.probeDiagnostic : "no_supported_explicit_license_status"
+                            requestEnd(worker, outcome: .inconclusive, reason: reason)
+                        }
                     }
+                } else if now.timeIntervalSince(observed.startedAt) >= budget {
+                    requestEnd(worker, outcome: .timedOut, reason: Self.loadingTimeoutReason(observed, now: now))
                 }
             } else if suspending {
                 if run.status == .running {
@@ -302,6 +356,11 @@ final class AutomaticScanner: ObservableObject {
                     else { worker.run = run; publish() }
                 }
             } else if run.status == .running {
+                // Retries are a single-host second pass. Never overlap a retry
+                // with normal work, another retry, or an owned host tearing down.
+                if run.nextTask?.isRetry == true {
+                    guard !hasActiveHosts, !workers.contains(where: { $0.run?.hasOrdinaryPending == true }) else { continue }
+                } else if workers.contains(where: { $0.sessionID != nil && $0.run?.current?.isRetry == true }) { continue }
                 // At most one item per worker per tick, including launch errors.
                 guard let task = run.beginNext() else { _ = commit(run, worker: worker); continue }
                 guard commit(run, worker: worker) else { continue }
@@ -314,6 +373,7 @@ final class AutomaticScanner: ObservableObject {
                     _ = commit(run, worker: worker)
                     continue
                 }
+                worker.clearSession()
                 if let id = launch(task) { worker.sessionID = id }
                 else {
                     do { try run.finishCurrent(outcome: .loadFailed, reason: "host_launch_failed", checkedAt: now) }

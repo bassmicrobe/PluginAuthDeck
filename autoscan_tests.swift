@@ -96,6 +96,52 @@ struct AutoScanTests {
         try placeholder.identifyCurrent(classID: "one", productName: "Product One", siblings: [classOne, classTwo])
         check(placeholder.totalCount == 2 && placeholder.pending == [classTwo], "class resolution absorbs an equivalent pending task")
 
+        // A retry keeps the first attempt with the same product identity. It
+        // never inflates product counts or replaces an unknown with a verdict.
+        var retryRun = AutoScanRun(tasks: [initial, secondModule])
+        retryRun.resume(); _ = retryRun.beginNext()
+        try retryRun.identifyCurrent(classID: "one", productName: "Product One")
+        check(try retryRun.retryCurrent(outcome: .timedOut, reason: "creating_instance_heartbeat_stalled",
+            checkedAt: Date(timeIntervalSince1970: 100)), "first transient failure can be queued once")
+        check(retryRun.completedCount == 0 && retryRun.totalCount == 2 && retryRun.current == nil,
+            "retry records an attempt without adding a completed product")
+        check(retryRun.beginNext() == secondModule, "ordinary work runs before the retry pass")
+        let unchangedUnknown = retryRun
+        check(try !retryRun.retryCurrent(outcome: .inconclusive, reason: "no_supported_explicit_license_status"),
+            "unknown does not loop automatically")
+        check(retryRun == unchangedUnknown, "declined retry leaves the current task intact")
+        try retryRun.finishCurrent(outcome: .inconclusive, reason: "no_supported_explicit_license_status")
+        let retryTask = retryRun.beginNext()!
+        check(retryTask.id == classOne.id && retryTask.isRetry && retryTask.launchBudgetSeconds == 60,
+            "retry retains exact identity and has the longer bounded launch budget")
+        try retryRun.identifyCurrent(classID: "one", productName: "Product One")
+        check(retryRun.current?.previousAttempts == retryTask.previousAttempts,
+            "class rediscovery preserves the initial diagnostic attempt")
+        retryRun.pause()
+        let retryStore = try AutoScanStore(directory: root.appendingPathComponent("Retry"))
+        try retryStore.save(retryRun)
+        var retryReload = try AutoScanStore(directory: root.appendingPathComponent("Retry")).run!
+        check(retryReload.status == .paused && retryReload.pending.first?.previousAttempts?.count == 1,
+            "paused/reloaded retries retain their history without starting a host")
+        retryReload.resume(); _ = retryReload.beginNext()
+        check(try !retryReload.retryCurrent(outcome: .loadFailed, reason: "instance_creation_failed"),
+            "second failure cannot schedule an unbounded third attempt")
+        try retryReload.finishCurrent(outcome: .loadFailed, reason: "instance_creation_failed")
+        check(retryReload.totalCount == 2 && retryReload.completedCount == 2
+            && retryReload.results.last?.task.previousAttempts?.first?.outcome == .timedOut,
+            "final outcome and first failure are preserved with one product count")
+        var recheckUnknown = AutoScanRun(tasks: [secondModule])
+        recheckUnknown.resume()
+        check(recheckUnknown.beginNext() == secondModule, "a new scan can explicitly recheck a previously unknown product")
+        let legacyEncoder = JSONEncoder()
+        let legacyTaskBytes = try legacyEncoder.encode(initial)
+        let legacyTask = try JSONDecoder().decode(AutoScanTask.self, from: legacyTaskBytes)
+        check(legacyTask.previousAttempts == nil && !legacyTask.isRetry && legacyTask.launchBudgetSeconds == 25,
+            "older task JSON without attempt metadata retains the ordinary budget")
+        let repeatedAttempt = AutoScanAttempt(outcome: .timedOut, reason: "loading_heartbeat_stalled", checkedAt: Date())
+        let invalidRetry = AutoScanRun(tasks: [AutoScanTask(entry: bundle, previousAttempts: [repeatedAttempt, repeatedAttempt])])
+        expectError("checkpoints reject an unbounded retry history") { try retryStore.save(invalidRetry) }
+
         let store = try AutoScanStore(directory: root.appendingPathComponent("Store"))
         check(store.run == nil && !fm.fileExists(atPath: store.fileURL.path), "no checkpoint means no implicit run")
         try store.save(run)

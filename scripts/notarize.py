@@ -22,7 +22,10 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 APP_NAME = 'Plugin Auth Desk.app'
 HELPER = 'Contents/Helpers/AuthPluginHost.app'
-ENTITLEMENTS = {'com.apple.security.cs.disable-library-validation': True}
+ENTITLEMENTS = {
+    'com.apple.security.cs.disable-library-validation': True,
+    'com.apple.security.cs.allow-unsigned-executable-memory': True,
+}
 PREPARING = {'copying', 'signing_helper', 'signing_app', 'verifying_signature'}
 STAGES = PREPARING | {'prepared', 'submitting', 'submitted', 'accepted', 'stapling', 'complete'}
 
@@ -361,7 +364,7 @@ def main(argv=None):
         run.mkdir(mode=0o700)
         entitlements = plistlib.loads((ROOT / 'packaging/host-entitlements.plist').read_bytes())
         if entitlements != ENTITLEMENTS:
-            raise RuntimeError('Only the reviewed disable-library-validation helper exception is allowed.')
+            raise RuntimeError('Only the reviewed plug-in-host runtime exceptions are allowed.')
         (run / 'host-entitlements.plist').write_bytes(plistlib.dumps(entitlements))
         atomic_json(run / 'state.json', state)
     validate_settings(state)
