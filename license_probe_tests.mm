@@ -13,6 +13,7 @@
 #include <iostream>
 #include <thread>
 #include <vector>
+#include <csignal>
 
 @interface ProbeFixture : NSObject
 @property NSString* role;
@@ -59,6 +60,31 @@
 }
 @end
 
+@interface ProbeDensePaintedFixture : NSView
+@end
+@implementation ProbeDensePaintedFixture
+- (void)drawRect:(NSRect)rect {
+    [[NSColor colorWithWhite:0.12 alpha:1] setFill]; NSRectFill(rect);
+    NSArray* words = @[@"INPUT", @"OUTPUT", @"GAIN", @"ATTACK", @"RELEASE", @"RATIO", @"METER", @"PRESET"];
+    NSDictionary* small = @{NSFontAttributeName:[NSFont systemFontOfSize:16],
+        NSForegroundColorAttributeName:[NSColor colorWithWhite:0.82 alpha:1]};
+    for (NSUInteger row = 0; row < 5; ++row)
+        for (NSUInteger col = 0; col < 12; ++col) {
+            CGFloat x = 14 + col * 154, y = 30 + row * 92;
+            [words[(row + col) % words.count] drawAtPoint:NSMakePoint(x, y) withAttributes:small];
+            [[NSColor colorWithWhite:0.5 alpha:1] setStroke];
+            [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(x + 16, y + 26, 44, 44)] stroke];
+            for (int tick = 0; tick < 9; ++tick) {
+                NSBezierPath* mark = [NSBezierPath bezierPath];
+                [mark moveToPoint:NSMakePoint(x + 4 + tick * 8, y + 22)];
+                [mark lineToPoint:NSMakePoint(x + 4 + tick * 8, y + 26)]; [mark stroke];
+            }
+        }
+    [@"This product is not activated" drawAtPoint:NSMakePoint(600, 520) withAttributes:@{
+        NSFontAttributeName:[NSFont boldSystemFontOfSize:28], NSForegroundColorAttributeName:NSColor.whiteColor}];
+}
+@end
+
 static ProbeFixture* fixture(NSString* role, NSString* text = @"")
 {
     ProbeFixture* object = [ProbeFixture new];
@@ -79,6 +105,14 @@ int main(int argc, char** argv)
                 || std::string(argv[2]).find_first_not_of("0123456789") != std::string::npos) return 2;
             const auto parent = strtoll(argv[2], nullptr, 10);
             if (parent <= 1 || parent > INT_MAX) return 2;
+            if (std::string(argv[1]) == "--ocr-worker" && getenv("PAD_TEST_OCR_HANG") != nullptr)
+            {
+                // Test only: simulate an uncooperative Vision call. The real
+                // parent must kill/reap this owned child and recover next time.
+                signal(SIGTERM, SIG_IGN);
+                std::this_thread::sleep_for(std::chrono::seconds(15));
+                return 3;
+            }
             return std::string(argv[1]) == "--ocr-warmup" ? runNativeOCRWarmup((int)parent) : runNativeOCRWorker((int)parent);
         }
         if (argc > 1 && std::string(argv[1]) == "--benchmark-ocr")
@@ -102,6 +136,26 @@ int main(int argc, char** argv)
             }
             return 0;
         }
+        if (argc > 1 && std::string(argv[1]) == "--benchmark-dense-ocr")
+        {
+            [NSApplication sharedApplication];
+            ProbeDensePaintedFixture* dense = [[ProbeDensePaintedFixture alloc] initWithFrame:NSMakeRect(0, 0, 1900, 580)];
+            dense.accessibilityChildren = @[];
+            bool success = true;
+            for (int sample = 0; sample < 5; ++sample)
+            {
+                ProbeResult rendering;
+                NSImage* image = renderMaskedLocalView(dense, rendering);
+                assert(image != nil);
+                const auto start = std::chrono::steady_clock::now();
+                const auto result = recognizeLocalImage(image, "Synthetic Product", rendering.sampledAtMilliseconds);
+                const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                std::cout << "isolated dense1900x580 sample=" << sample + 1 << " ms=" << ms
+                          << " diagnostic=" << result.diagnostic << " nodes=" << result.staticTextNodes << std::endl;
+                success &= result.rule == "product_not_activated";
+            }
+            return success ? 0 : 1;
+        }
         assert(runNativeOCRWorker(0) == 2);
         assert(runNativeOCRWorker((int)getpid()) == 2); // Never accept a claimed, non-parent PID.
         assert(runNativeOCRWarmup(0) == 2);
@@ -120,12 +174,24 @@ int main(int argc, char** argv)
             {"Registration status: not registered", "Product", "product_not_registered"},
             {"Orra Filter is unlicensed", "Orra Filter", "unlicensed_status"},
             {"License status: unlicensed", "Product", "unlicensed_status"},
+            // UA's native plug-in troubleshooting docs distinguish this error
+            // from hardware, connectivity and ordinary Activate License UI.
+            {"Plug-in Not Licensed", "UADx 1176 Rev A Compressor", "unlicensed_status"},
+            {"Plugin Not Licensed", "UADx LA-2A Leveler Collection", "unlicensed_status"},
+            {"Plug-in Not Licensed", "Other Compressor", ""},
+            {"DISABLED", "UAD 4K Buss Compressor", ""},
+            {"Activate License", "UADx 1176 Rev A Compressor", ""},
+            {"No Connection to UA Connect", "UADx 1176 Rev A Compressor", ""},
+            {"Not Logged In", "UADx 1176 Rev A Compressor", ""},
+            {"GUI Load Failed", "UADx 1176 Rev A Compressor", ""},
             {"No valid license was found for this product", "Product", "no_valid_license"},
             {"この製品は認証されていません", "Product", "product_not_activated"},
             {"Orra Filter is unregistered", "Orra Filter", "product_not_registered"},
             {"This is an unregistered version of Orra Filter", "Orra Filter", "product_not_registered"},
             {"Registration status: unregistered", "Product", "product_not_registered"},
             {"This product is not authorized", "Product", "product_not_activated"},
+            {"This plug-in is not licensed", "Product", "unlicensed_status"},
+            {"This product requires activation", "Product", "product_not_activated"},
             {"Orra Filter is running in demo mode", "Orra Filter", "demo_mode"},
             {"This plug-in is in trial mode", "Product", "demo_mode"},
             {"This software is running in evaluation mode", "Product", "demo_mode"},
@@ -179,7 +245,19 @@ int main(int argc, char** argv)
         Limits generous {256, 12, 200.0};
         ProbeFixture* positive = fixture(NSAccessibilityStaticTextRole, @"Orra Filter is not activated on this machine");
         auto detected = inspectLocalRoots(@[positive], "Orra Filter", generous);
-        assert(detected.rule == "product_not_activated");
+        assert(detected.rule == "product_not_activated" && detected.contentObserved);
+        auto emptyText = inspectLocalRoots(@[fixture(NSAccessibilityStaticTextRole, @"   \n")], "Product", generous);
+        assert(!emptyText.contentObserved && emptyText.staticTextNodes == 0);
+        auto ordinaryText = inspectLocalRoots(@[fixture(NSAccessibilityStaticTextRole, @"Input Gain")], "Product", generous);
+        assert(ordinaryText.contentObserved && ordinaryText.rule.empty());
+        ProbeFixture* dspDisabled = fixture(NSAccessibilityButtonRole, @"DISABLED");
+        auto disabledResult = inspectLocalRoots(@[dspDisabled], "UAD 4K Buss Compressor", generous);
+        assert(disabledResult.rule.empty() && disabledResult.diagnostic == "uad_dsp_disabled" && !disabledResult.contentObserved);
+        assert(inspectLocalRoots(@[dspDisabled], "UADx 1176 Rev A Compressor", generous).diagnostic != "uad_dsp_disabled");
+        assert(inspectLocalRoots(@[dspDisabled], "Other Compressor", generous).diagnostic != "uad_dsp_disabled");
+        auto explicitFailure = inspectLocalRoots(@[dspDisabled, fixture(NSAccessibilityStaticTextRole, @"This product is not activated")],
+                                                 "UAD 4K Buss Compressor", generous);
+        assert(explicitFailure.rule == "product_not_activated");
 
         // Neither the input's value nor its descendants may be inspected.
         for (NSString* role in @[NSAccessibilityTextFieldRole, NSAccessibilityTextAreaRole, NSAccessibilityPopUpButtonRole])
@@ -204,6 +282,23 @@ int main(int argc, char** argv)
         assert(inspectLocalRoots(@[action], "Product", generous).rule.empty());
         assert(inspectLocalRoots(@[prompt], "Product", generous).rule.empty());
         assert(inspectLocalRoots(@[prompt, input, action], "Product", generous).rule.empty()); // separate scopes
+        ProbeFixture* dismiss = fixture(NSAccessibilityButtonRole, @"Quit");
+        ProbeFixture* requirement = fixture(NSAccessibilityStaticTextRole, @"Activation Required");
+        form.children = @[requirement, action, dismiss];
+        assert(inspectLocalRoots(@[form], "Product", generous).rule == "product_not_activated");
+        form.children = @[requirement, action];
+        assert(inspectLocalRoots(@[form], "Product", generous).rule.empty());
+        form.children = @[requirement, dismiss];
+        assert(inspectLocalRoots(@[form], "Product", generous).rule.empty());
+        form.children = @[requirement, action, dismiss, fixture(NSAccessibilityStaticTextRole, @"Licensed to Example User")];
+        assert(inspectLocalRoots(@[form], "Product", generous).rule.empty());
+        ProbeFixture* message = fixture(NSAccessibilityStaticTextRole, @"This product is not activated. Please activate a license before continuing.");
+        form.children = @[message, action, dismiss];
+        assert(inspectLocalRoots(@[form], "Product", generous).rule == "product_not_activated");
+        form.children = @[message, action];
+        assert(inspectLocalRoots(@[form], "Product", generous).rule.empty());
+        form.children = @[fixture(NSAccessibilityStaticTextRole, @"For example: this product is not activated. Click Activate."), action, dismiss];
+        assert(inspectLocalRoots(@[form], "Product", generous).rule.empty());
         form.children = @[prompt, input, action, fixture(NSAccessibilityStaticTextRole, @"FAQ")];
         assert(inspectLocalRoots(@[form], "Product", generous).rule.empty());
         form.children = @[positive, fixture(NSAccessibilityStaticTextRole, @"Activation Help")];
@@ -241,7 +336,7 @@ int main(int argc, char** argv)
         ProbeFixture* slow = fixture(NSAccessibilityGroupRole);
         slow.slowRole = YES; slow.children = @[positive];
         auto expiredBudget = inspectLocalRoots(@[slow], "Orra Filter", {256, 12, 1.0});
-        assert(expiredBudget.budgetExhausted && expiredBudget.rule.empty() && slow.childrenReads == 0);
+        assert(expiredBudget.budgetExhausted && !expiredBudget.contentObserved && expiredBudget.rule.empty() && slow.childrenReads == 0);
         ProbeFixture* throwing = fixture(NSAccessibilityGroupRole);
         throwing.throwChildren = YES;
         assert(inspectLocalRoots(@[throwing], "Product", generous).rule.empty());
@@ -274,7 +369,35 @@ int main(int argc, char** argv)
         NSImage* rendered = renderMaskedLocalView(painted, rendering);
         assert(rendered != nil && rendering.sampledAtMilliseconds > 0);
         const auto paintedResult = recognizeLocalImage(rendered, "Product", rendering.sampledAtMilliseconds);
-        assert(paintedResult.rule == "product_not_activated" && paintedResult.sampledAtMilliseconds == rendering.sampledAtMilliseconds);
+        assert(paintedResult.rule == "product_not_activated" && paintedResult.contentObserved
+               && paintedResult.sampledAtMilliseconds == rendering.sampledAtMilliseconds);
+        setenv("PAD_TEST_OCR_HANG", "1", 1);
+        const auto hungStart = std::chrono::steady_clock::now();
+        const auto hungResult = recognizeLocalImage(rendered, "Product");
+        unsetenv("PAD_TEST_OCR_HANG");
+        const auto hungSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - hungStart).count();
+        assert(hungResult.diagnostic == "ocr_time_budget_exceeded" && !hungResult.contentObserved);
+        assert(hungSeconds >= 2 && hungSeconds < 5);
+        assert(recognizeLocalImage(rendered, "Product").rule == "product_not_activated");
+        painted.lines = @[@"This product is not", @"activated on this machine"];
+        assert(recognizeLocalImage(renderMaskedLocalView(painted, rendering), "Product").rule == "product_not_activated");
+        painted.lines = @[@"Activation Required", @"Activate", @"Quit"];
+        assert(recognizeLocalImage(renderMaskedLocalView(painted, rendering), "Product").rule == "product_not_activated");
+        painted.lines = @[@"This product is not", @"activated on this machine?"];
+        assert(recognizeLocalImage(renderMaskedLocalView(painted, rendering), "Product").rule.empty());
+        painted.lines = @[@"Plug-in Not Licensed"];
+        assert(recognizeLocalImage(renderMaskedLocalView(painted, rendering), "UADx 1176 Rev A Compressor").rule == "unlicensed_status");
+        assert(recognizeLocalImage(renderMaskedLocalView(painted, rendering), "Other Compressor").rule.empty());
+        painted.lines = @[@"DISABLED", @"Input Output Gain Frequency"];
+        const auto disabledOCR = recognizeLocalImage(renderMaskedLocalView(painted, rendering), "UAD 4K Buss Compressor");
+        assert(disabledOCR.rule.empty() && disabledOCR.diagnostic == "uad_dsp_disabled" && !disabledOCR.contentObserved);
+        assert(recognizeLocalImage(renderMaskedLocalView(painted, rendering), "UADx 1176 Rev A Compressor").contentObserved);
+        painted.lines = @[];
+        const auto blankResult = recognizeLocalImage(renderMaskedLocalView(painted, rendering), "Product");
+        assert(!blankResult.contentObserved && blankResult.staticTextNodes == 0 && blankResult.diagnostic == "ocr_no_text");
+        painted.lines = @[@"Input Output Gain Frequency"];
+        const auto normalResult = recognizeLocalImage(renderMaskedLocalView(painted, rendering), "Product");
+        assert(normalResult.contentObserved && normalResult.rule.empty() && normalResult.diagnostic == "ocr_no_supported_status");
         const auto expiredCapture = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now().time_since_epoch()).count() - 3000.0;
         const auto expiredRecognition = recognizeLocalImage(rendered, "Product", expiredCapture);

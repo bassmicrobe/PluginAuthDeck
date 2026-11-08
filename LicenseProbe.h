@@ -32,6 +32,10 @@ struct ProbeResult
     double sampledAtMilliseconds = 0.0; // steady_clock capture time, not consume time
     std::size_t staticTextNodes = 0;
     std::size_t maskedRegions = 0;
+    // A complete, nonempty observation of readable local UI content. False
+    // for blank/unrenderable editors, pending OCR or an incomplete traversal.
+    // This is coverage evidence only, never proof that a license is valid.
+    bool contentObserved = false;
     std::string diagnostic; // fixed codes only, never UI/OCR text
 };
 
@@ -66,7 +70,9 @@ ProbeResult inspectLocalRoots(NSArray* roots, std::string_view productName, Limi
 
 // Test seams: local view rendering and in-memory image recognition, without a
 // visible window or capture API. A nil image means safe rendering was impossible.
-// Neither function writes an image or returns recognized strings.
+// Neither function writes an image or returns recognized strings. Recognition
+// runs in the owned native worker even when the calling host is native arm64;
+// plug-in process state cannot contaminate Vision or leave a stuck OCR job.
 NSImage* renderMaskedLocalView(NSView* view, ProbeResult& diagnostics);
 ProbeResult recognizeLocalImage(NSImage* image, std::string_view productName, double sampledAtMilliseconds = 0.0);
 // Pure source-selection policy: reconfirm a positive source before rotating to

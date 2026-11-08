@@ -146,12 +146,12 @@ final class FakeOCRPreparation: OCRPreparationTask {
         let ordinary = AutoScanTask(entry: entry)
         let retry = AutoScanTask(entry: entry, classID: "selected-class", previousAttempts: [
             AutoScanAttempt(outcome: .timedOut, reason: "creating_instance_heartbeat_stalled", checkedAt: Date())])
-        for (task, expected) in [(ordinary, 35), (retry, 70)] {
+        for (task, expected) in [(ordinary, 45), (retry, 80)] {
             let request = DeskModel.hostRequest(entry: task.entry, classID: task.classID, automatic: true,
                 scanBudgetSeconds: task.launchBudgetSeconds, parentPID: 12345)
             let decoded = try JSONSerialization.jsonObject(with: JSONSerialization.data(withJSONObject: request)) as! [String: Any]
             try expect(decoded["scanDeadlineSeconds"] as? Int == expected && decoded["mode"] as? String == "scan",
-                "ordinary/retry task budget reaches the serialized host request as 35/70 seconds")
+                "ordinary/retry task budget reaches the serialized host request as 45/80 seconds")
             try expect(decoded["path"] as? String == entry.path && decoded["identifier"] as? String == entry.identifier
                 && decoded["classID"] as? String == task.classID && decoded["parentPID"] as? Int == 12345,
                 "deadline selection does not change the requested plug-in/class or parent ownership")
@@ -163,7 +163,7 @@ final class FakeOCRPreparation: OCRPreparationTask {
         for budget in [0.0, -1.0, 1000000.0, Double.nan, Double.infinity] {
             let request = DeskModel.hostRequest(entry: entry, classID: "", automatic: true,
                 scanBudgetSeconds: budget, parentPID: 12345)
-            try expect(request["scanDeadlineSeconds"] as? Int == 35 && JSONSerialization.isValidJSONObject(request),
+            try expect(request["scanDeadlineSeconds"] as? Int == 45 && JSONSerialization.isValidJSONObject(request),
                 "unexpected launch budgets cannot create an unbounded or invalid JSON host deadline")
         }
     }

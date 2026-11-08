@@ -275,7 +275,7 @@ final class Hosts {
         let probeCases: [(String, String)] = [
             ("ocr_native_worker_failed", "ocr_native_worker_failed"),
             ("ocr_recognition_failed", "ocr_recognition_failed"),
-            ("ocr_time_budget_exceeded: vendor text", "no_supported_explicit_license_status")]
+            ("ocr_time_budget_exceeded: vendor text", "no_completed_license_inspection")]
         for (index, values) in probeCases.enumerated() {
             let probeDir = root.appendingPathComponent("ocr-no-retry-\(index)")
             let probe = AutomaticScanner(directory: probeDir, automaticallyTick: false)
@@ -304,13 +304,188 @@ final class Hosts {
         recoveredHosts.observations[recoveredID]?.probeDiagnostic = "ocr_time_budget_exceeded"
         recovered.tick(now: base.addingTimeInterval(3))
         recoveredHosts.observations[recoveredID]?.probeDiagnostic = "ocr_no_supported_status"
+        recoveredHosts.observations[recoveredID]?.probeCompletedInspectionCount = 2
+        recoveredHosts.observations[recoveredID]?.probeTextInspectionCount = 2
         recovered.tick(now: base.addingTimeInterval(6))
         recoveredHosts.close(recoveredID)
         recovered.tick(now: base.addingTimeInterval(7))
         try expect(recovered.isComplete && recoveredHosts.launchOrder.count == 1
-            && recovered.results.first?.outcome == .inconclusive
-            && recovered.results.first?.reason == "no_supported_explicit_license_status",
+            && recovered.results.first?.outcome == .noActivationDetected
+            && recovered.results.first?.reason == "inspected_no_activation_status",
             "a completed later probe replaces the earlier timeout without a needless retry")
+
+        // A ready editor can still be waiting for its first useful capture.
+        // Wait for that bounded operation rather than treating pending as a
+        // negative inspection, but do not let a responsive host wait forever.
+        do {
+            let pendingDir = root.appendingPathComponent("pending-inspection-bound")
+            let pending = AutomaticScanner(directory: pendingDir, automaticallyTick: false, automaticallyRetryFailures: false)
+            let pendingHosts = Hosts(directory: pendingDir, base: base)
+            pendingHosts.attach(pending)
+            pending.start(tasks: [tasks[0]])
+            let id = pendingHosts.launchOrder[0]
+            pendingHosts.ready(id)
+            pendingHosts.observations[id]?.phase = "observing"
+            pendingHosts.observations[id]?.probeDiagnostic = "ocr_pending"
+            pending.tick(now: base.addingTimeInterval(6))
+            try expect(pendingHosts.stops.isEmpty && pending.completedCount == 0,
+                "pending OCR at six seconds receives the bounded inspection grace")
+            pending.tick(now: base.addingTimeInterval(13.999))
+            try expect(pendingHosts.stops.isEmpty, "pending OCR can finish before the fourteen-second absolute bound")
+            pending.tick(now: base.addingTimeInterval(14))
+            try expect(pendingHosts.stops == [id] && pending.completedCount == 0,
+                "pending OCR reaches a hard fourteen-second bound and still waits for process exit")
+            pendingHosts.observations[id]?.phase = "closed"
+            pendingHosts.close(id)
+            pending.tick(now: base.addingTimeInterval(15))
+            let result = pending.results.first
+            try expect(pending.isComplete && result?.outcome == .inconclusive && result?.reason == "ocr_pending",
+                "never-completed capture remains unresolved with its specific diagnostic")
+            let saved = AutomaticScanner(directory: pendingDir, automaticallyTick: false, automaticallyRetryFailures: false)
+            try expect(saved.results.first?.diagnostics == result?.diagnostics
+                && result?.diagnostics?.phase == "closed"
+                && result?.diagnostics?.completedInspectionCount == 0,
+                "capture diagnostics remain available after the host closes and checkpoint reloads")
+        }
+
+        do {
+            let readableDir = root.appendingPathComponent("readable-distinct-inspections")
+            try FileManager.default.createDirectory(at: readableDir, withIntermediateDirectories: true)
+            let licenseFile = readableDir.appendingPathComponent("license-state.json")
+            let licenseBytes = Data("{\"fixture\":\"existing manual decision remains unchanged\"}".utf8)
+            try licenseBytes.write(to: licenseFile)
+            let readable = AutomaticScanner(directory: readableDir, automaticallyTick: false, automaticallyRetryFailures: false)
+            let readableHosts = Hosts(directory: readableDir, base: base)
+            readableHosts.attach(readable)
+            readable.start(tasks: [AutoScanTask(entry: entries[0], classID: "readable-class")])
+            let id = readableHosts.launchOrder[0]
+            readableHosts.ready(id)
+            readableHosts.observations[id]?.phase = "observing"
+            readableHosts.observations[id]?.probeDiagnostic = "ocr_no_supported_status"
+            readableHosts.observations[id]?.probeStaticTextNodes = 12
+            readableHosts.observations[id]?.probeMaskedRegions = 4
+            readableHosts.observations[id]?.probeCompletedInspectionCount = 1
+            readableHosts.observations[id]?.probeTextInspectionCount = 1
+            readable.tick(now: base.addingTimeInterval(6))
+            readable.tick(now: base.addingTimeInterval(7))
+            try expect(readableHosts.stops.isEmpty,
+                "polling the same single completed inspection twice cannot substitute for two inspections")
+            readableHosts.observations[id]?.probeCompletedInspectionCount = 2
+            readableHosts.observations[id]?.probeTextInspectionCount = 2
+            readable.tick(now: base.addingTimeInterval(8))
+            try expect(readableHosts.stops == [id] && readable.completedCount == 0,
+                "a second readable inspection ends observation but not process ownership")
+            readableHosts.observations[id]?.phase = "closed"
+            readableHosts.close(id)
+            readable.tick(now: base.addingTimeInterval(9))
+            let result = readable.results.first
+            try expect(result?.outcome == .noActivationDetected && readable.inconclusiveCount == 0
+                && readable.unactivatedCount == 0 && result?.task.classID == "readable-class",
+                "two completed readable inspections produce only the limited no-activation-display result")
+            try expect(result?.diagnostics == AutoScanDiagnostics(phase: "closed", probeDiagnostic: "ocr_no_supported_status",
+                staticTextNodes: 12, maskedRegions: 4, completedInspectionCount: 2, textInspectionCount: 2),
+                "closed-host inspection counters and code are retained without scraped content")
+            try expect(try Data(contentsOf: licenseFile) == licenseBytes,
+                "negative display inspection does not alter existing license-state records")
+            let reloaded = AutomaticScanner(directory: readableDir, automaticallyTick: false, automaticallyRetryFailures: false)
+            try expect(reloaded.results == readable.results && reloaded.isComplete,
+                "negative display inspection and its evidence survive restart without becoming licensed")
+        }
+
+        // Even historical successful samples cannot override the latest failed
+        // capture, and completed blank images are not readable inspections.
+        for (index, values) in [("ocr_no_supported_status", 2, 0),
+                                ("ax_no_supported_status", 2, 1),
+                                ("ocr_recognition_failed", 2, 2),
+                                ("ocr_image_unavailable", 4, 3),
+                                ("ocr_no_supported_status", 2, 3)].enumerated() {
+            let noEvidenceDir = root.appendingPathComponent("inspection-not-negative-\(index)")
+            let noEvidence = AutomaticScanner(directory: noEvidenceDir, automaticallyTick: false, automaticallyRetryFailures: false)
+            let noEvidenceHosts = Hosts(directory: noEvidenceDir, base: base)
+            noEvidenceHosts.attach(noEvidence)
+            noEvidence.start(tasks: [tasks[0]])
+            let id = noEvidenceHosts.launchOrder[0]
+            noEvidenceHosts.ready(id)
+            noEvidenceHosts.observations[id]?.probeDiagnostic = values.0
+            noEvidenceHosts.observations[id]?.probeCompletedInspectionCount = values.1
+            noEvidenceHosts.observations[id]?.probeTextInspectionCount = values.2
+            noEvidence.tick(now: base.addingTimeInterval(6))
+            noEvidenceHosts.close(id)
+            noEvidence.tick(now: base.addingTimeInterval(7))
+            try expect(noEvidence.isComplete && noEvidence.results.first?.outcome == .inconclusive
+                && noEvidence.unactivatedCount == 0,
+                "blank, partly readable, failed, or internally inconsistent captures never become negative display checks")
+        }
+
+        do {
+            let invalidDir = root.appendingPathComponent("invalid-inspection-fields")
+            let invalid = AutomaticScanner(directory: invalidDir, automaticallyTick: false, automaticallyRetryFailures: false)
+            let invalidHosts = Hosts(directory: invalidDir, base: base)
+            invalidHosts.attach(invalid)
+            invalid.start(tasks: [tasks[0]])
+            let id = invalidHosts.launchOrder[0]
+            invalidHosts.ready(id)
+            invalidHosts.observations[id]?.phase = "raw phase text\nnot a diagnostic code"
+            invalidHosts.observations[id]?.probeDiagnostic = "raw capture text must not reach storage"
+            invalidHosts.observations[id]?.probeStaticTextNodes = 4097
+            invalidHosts.observations[id]?.probeMaskedRegions = -1
+            invalidHosts.observations[id]?.probeCompletedInspectionCount = 100001
+            invalidHosts.observations[id]?.probeTextInspectionCount = 3
+            invalid.tick(now: base.addingTimeInterval(6))
+            invalidHosts.close(id)
+            invalid.tick(now: base.addingTimeInterval(7))
+            try expect(invalid.isComplete && invalid.error.isEmpty
+                && invalid.results.first?.outcome == .inconclusive
+                && invalid.results.first?.reason == "no_completed_license_inspection"
+                && invalid.results.first?.diagnostics == AutoScanDiagnostics(),
+                "untrusted codes and impossible counts are discarded before checkpoint validation")
+            let stateURL = invalid.checkpointDirectory.appendingPathComponent("worker-0/autoscan-state.json")
+            let bytes = try String(contentsOf: stateURL, encoding: .utf8)
+            try expect(!bytes.contains("raw phase text") && !bytes.contains("raw capture text"),
+                "rejected free-form probe content never appears in the durable checkpoint")
+        }
+
+        do {
+            let diagnosticsDir = root.appendingPathComponent("retry-inspection-diagnostics")
+            let diagnostics = AutomaticScanner(directory: diagnosticsDir, automaticallyTick: false)
+            let diagnosticsHosts = Hosts(directory: diagnosticsDir, base: base)
+            diagnosticsHosts.attach(diagnostics)
+            diagnostics.start(tasks: [tasks[0]])
+            let firstID = diagnosticsHosts.launchOrder[0]
+            diagnosticsHosts.ready(firstID)
+            diagnosticsHosts.observations[firstID]?.phase = "observing"
+            diagnosticsHosts.observations[firstID]?.probeDiagnostic = "ocr_time_budget_exceeded"
+            diagnosticsHosts.observations[firstID]?.probeCompletedInspectionCount = 1
+            diagnosticsHosts.observations[firstID]?.probeTextInspectionCount = 1
+            diagnostics.tick(now: base.addingTimeInterval(6))
+            diagnosticsHosts.observations[firstID]?.phase = "closed"
+            diagnosticsHosts.close(firstID)
+            diagnostics.tick(now: base.addingTimeInterval(7))
+            let firstDiagnostics = AutoScanDiagnostics(phase: "closed", probeDiagnostic: "ocr_time_budget_exceeded",
+                completedInspectionCount: 1, textInspectionCount: 1)
+            let pendingRetry = diagnostics.runs.flatMap(\.pending).first
+            try expect(pendingRetry?.previousAttempts?.first?.diagnostics == firstDiagnostics,
+                "first-attempt capture diagnostics are preserved when timeout schedules one retry")
+            diagnostics.tick(now: base.addingTimeInterval(8))
+            let retryID = diagnosticsHosts.launchOrder.last!
+            try expect(retryID != firstID && diagnosticsHosts.targets[retryID]?.previousAttempts?.first?.diagnostics == firstDiagnostics,
+                "the retry launch receives its own durable first-attempt inspection history")
+            diagnosticsHosts.observations[retryID]?.startedAt = base.addingTimeInterval(8)
+            diagnosticsHosts.ready(retryID, at: base.addingTimeInterval(8))
+            diagnosticsHosts.observations[retryID]?.phase = "observing"
+            diagnosticsHosts.observations[retryID]?.probeDiagnostic = "ax_no_supported_status"
+            diagnosticsHosts.observations[retryID]?.probeCompletedInspectionCount = 2
+            diagnosticsHosts.observations[retryID]?.probeTextInspectionCount = 2
+            diagnostics.tick(now: base.addingTimeInterval(14))
+            diagnosticsHosts.close(retryID)
+            diagnostics.tick(now: base.addingTimeInterval(15))
+            let saved = AutomaticScanner(directory: diagnosticsDir, automaticallyTick: false, automaticallyRetryFailures: false)
+            try expect(saved.isComplete && saved.results.count == 1
+                && saved.results.first?.outcome == .noActivationDetected
+                && saved.results.first?.diagnostics?.probeDiagnostic == "ax_no_supported_status"
+                && saved.results.first?.task.previousAttempts?.first?.diagnostics == firstDiagnostics,
+                "final readable result and original timeout diagnostics remain distinct after retry and reload")
+        }
 
         // One serial second pass for explicit creation failures/timeouts. It
         // starts only after ordinary tasks and all prior hosts have exited.
@@ -790,11 +965,11 @@ def main():
         originals = ['Ordinary, "quoted"\n音色', '=1+1', '+SUM(1,2)', '-1+2', '@SUM(1,2)',
                      ' \t=1+1', '\n=1+1', '\r=1+1', '\tplain', '＝1+1', '\ufeff=1+1', "'=literal"]
         expected = {value if i in (0, len(originals) - 1) else "'" + value for i, value in enumerate(originals)}
-        assert rows[0] == ['Product', 'Vendor', 'Format', 'Result', 'Reason', 'Path', 'ClassID']
+        assert rows[0] == ['Product', 'Vendor', 'Format', 'Result', 'Reason', 'Path', 'ClassID', 'Phase', 'ProbeDiagnostic', 'CompletedInspections', 'TextInspections']
         assert len(rows) == len(originals) + 1
         assert {row[0] for row in rows[1:]} == expected
         for row in rows[1:]:
-            assert len(row) == 7, "quotes, commas, CR and LF must stay inside their cells"
+            assert len(row) == 11, "quotes, commas, CR and LF must stay inside their cells"
             assert row[0] == row[1] == row[4] == row[6], "all vendor-controlled fields use safe CSV encoding"
             assert row[2] == 'VST3' and row[5].startswith(str(directory)), "ordinary fields preserve their content"
         print(f"PASS: {len(originals)} CSV export cases (formula prefixes, controls, Unicode, quoting, ordinary text)")

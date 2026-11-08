@@ -6,6 +6,10 @@
 #include <cstdint>
 #include <cmath>
 #include <limits>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <unistd.h>
 
 namespace HostRequestPolicy
 {
@@ -37,6 +41,22 @@ int scanDeadline(double requested, bool present)
 
 double probePollDelayMilliseconds(bool pending) { return pending ? 250.0 : 2000.0; }
 constexpr int scanSoftQuitMarginSeconds = 1;
+constexpr int shutdownGraceSeconds = 8;
+
+bool armScanShutdownSentinel(bool scanMode, std::atomic<bool>& sentinelArmed)
+{
+    if (!scanMode || sentinelArmed.exchange(true)) return false;
+    // Capture no Host/application state: this must remain safe after every
+    // owned object and the normal watchdog have been destroyed. A vendor or
+    // framework atexit destructor must not keep an unattended helper alive.
+    // _exit affects this process only, never another application or saved PID.
+    std::thread([]
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(shutdownGraceSeconds));
+        _exit(73);
+    }).detach();
+    return true;
+}
 
 // Match JUCE's macOS normalized FUID hash without constructing a component.
 int vstClassUID(const unsigned char* bytes)
@@ -170,7 +190,12 @@ struct MetadataHostContext final : Steinberg::Vst::IHostApplication
         return Steinberg::kResultOk;
     }
     Steinberg::uint32 PLUGIN_API addRef() override { return ++references; }
-    Steinberg::uint32 PLUGIN_API release() override { return --references; }
+    Steinberg::uint32 PLUGIN_API release() override
+    {
+        const auto remaining = --references;
+        if (remaining == 0) delete this;
+        return remaining;
+    }
     Steinberg::tresult PLUGIN_API getName(Steinberg::Vst::String128 name) override
     {
         std::fill_n(name, 128, 0);
@@ -187,8 +212,9 @@ struct MetadataHostContext final : Steinberg::Vst::IHostApplication
 };
 
 // Unlike JUCE findAllTypesForFile's slow path, this never calls factory
-// createInstance/component.initialize for any sibling class. Keep the module
-// alive until the selected JUCE instance has been destroyed.
+// createInstance/component.initialize for any sibling class. All descriptions
+// own their metadata. End this module session before JUCE opens its independent
+// instance session, avoiding overlapping bundleEntry calls/host contexts.
 class VSTMetadataModule
 {
 public:
@@ -200,7 +226,11 @@ public:
         if (entered && bundle)
             if (auto exit = reinterpret_cast<bool (*)()>(CFBundleGetFunctionPointerForName(bundle, CFSTR("bundleExit")))) exit();
         if (bundle) CFRelease(bundle);
+        // A factory is permitted to retain its host context. Give it a real
+        // refcounted lifetime rather than a pointer into this temporary object.
+        context->release();
     }
+    bool usedFactory() const { return factoryAttempted; }
     bool enumerate(const File& file, OwnedArray<PluginDescription>& result)
     {
         if (!file.isDirectory() || !file.hasFileExtension("vst3")) return false;
@@ -208,6 +238,7 @@ public:
         // moduleinfo (including its SDK-supported trailing-comma JSON syntax).
         for (const auto* location : {"Contents/Resources/moduleinfo.json", "Contents/moduleinfo.json"})
             if (readModuleInfo(file, file.getChildFile(location), result)) return true;
+        factoryAttempted = true;
         const auto path = file.getFullPathName().toUTF8();
         auto url = CFURLCreateFromFileSystemRepresentation(nullptr, reinterpret_cast<const UInt8*>(path.getAddress()),
                                                          static_cast<CFIndex>(path.sizeInBytes() - 1), true);
@@ -222,7 +253,7 @@ public:
         if (!getFactory || !(factory = getFactory())) return false;
         factory->queryInterface(Steinberg::IPluginFactory2_iid, reinterpret_cast<void**>(&factory2));
         factory->queryInterface(Steinberg::IPluginFactory3_iid, reinterpret_cast<void**>(&factory3));
-        if (factory3) factory3->setHostContext(&context);
+        if (factory3) factory3->setHostContext(context);
         Steinberg::PFactoryInfo factoryInfo {};
         factory->getFactoryInfo(&factoryInfo);
         const auto count = factory->countClasses();
@@ -317,9 +348,10 @@ private:
         validated.clear(false);
         return true;
     }
-    MetadataHostContext context;
+    MetadataHostContext* context = new MetadataHostContext();
     CFBundleRef bundle = nullptr;
     bool entered = false;
+    bool factoryAttempted = false;
     Steinberg::IPluginFactory* factory = nullptr;
     Steinberg::IPluginFactory2* factory2 = nullptr;
     Steinberg::IPluginFactory3* factory3 = nullptr;
@@ -407,8 +439,9 @@ std::optional<std::string> readRequestFile(const File& request)
 }
 }
 
-// One selected plug-in per process. No AudioDeviceManager, MIDI device, audio
-// callback, prepareToPlay(), or network client is created by this host.
+// One selected plug-in per process. The processor is initialized before its
+// editor, as in a DAW, but no AudioDeviceManager, MIDI device, rendering callback,
+// processBlock(), or network client is created by this host.
 class Host final : public JUCEApplication, private Timer
 {
 public:
@@ -439,6 +472,11 @@ public:
         scanDeadlineSeconds = HostRequestPolicy::scanDeadline(double(requestedDeadline), hasDeadline);
         if (scanDeadlineSeconds < 0 || (hasDeadline && !requestedDeadline.isInt() && !requestedDeadline.isInt64() && !requestedDeadline.isDouble()))
         { fail("Invalid scan deadline", "invalid_request"); return; }
+        const auto initialization = config["initializeProcessor"];
+        const bool hasInitialization = config.hasProperty("initializeProcessor");
+        if (hasInitialization && !initialization.isBool())
+        { fail("Invalid processor initialization option", "invalid_request"); return; }
+        initializeProcessor = !hasInitialization || static_cast<bool>(initialization);
         parent = int(config["parentPID"]);
         pluginName = config["name"].toString();
         // A saved PID can be reused after a crash. Our actual parent relationship
@@ -480,10 +518,18 @@ public:
         const auto identifier = config["identifier"].toString();
         if (fmt == "VST3" && File::isAbsolutePath(identifier))
         {
-            metadataModule = std::make_unique<VSTMetadataModule>();
-            enumerated = metadataModule->enumerate(File(identifier), descriptions);
+            // This scope must end before instantiate(). JUCE creates and retains
+            // its own refcounted module/factory; holding our metadata session
+            // alongside it causes a second bundleEntry on the same executable.
+            VSTMetadataModule metadata;
+            enumerated = metadata.enumerate(File(identifier), descriptions);
+            enumerationStrategy = metadata.usedFactory() ? "vst3_factory" : "vst3_moduleinfo";
         }
-        else if (fmt == "AU") enumerated = enumerateAU(identifier, descriptions);
+        else if (fmt == "AU")
+        {
+            enumerationStrategy = "au_registry";
+            enumerated = enumerateAU(identifier, descriptions);
+        }
         if (!enumerated)
         {
             descriptions.clear(); // Never publish an incomplete factory catalog.
@@ -555,18 +601,41 @@ public:
                     return;
                 }
                 plugin = std::move(instance);
+                if (initializeProcessor)
+                {
+                    // Many editors depend on resources/license status prepared
+                    // by initialize/setActive. Opening an editor on an unopened
+                    // processor can crash vendor AU views or suppress its auth
+                    // screen. This allocates processor resources only: no audio
+                    // device or rendering thread is opened and no samples run.
+                    // The independent scan watchdog also bounds this call.
+                    setPhase("initializing_processor");
+                    report("loading", "Initializing plug-in without audio output");
+                    plugin->prepareToPlay(48000.0, 512);
+                    processorInitialized = true;
+                }
+                if (quitting.load()) return;
                 setPhase("creating_editor");
                 report("loading", "Creating plug-in window");
-                auto* editor = plugin->createEditorAndMakeActive();
+                std::unique_ptr<AudioProcessorEditor> editor(plugin->createEditorAndMakeActive());
+                // Initialization/editor creation can run a vendor modal loop.
+                // Stop may be accepted reentrantly there: never open another
+                // window or overwrite stopping/closing with ready afterward.
+                if (quitting.load()) return;
                 if (!editor) { fail("This plug-in has no custom editor. Use its manufacturer's license app.", "no_custom_editor"); return; }
                 window->setName(pluginName + " — Plugin Auth Desk");
-                window->setContentOwned(editor, true);
-                window->setResizable(editor->isResizable(), false);
-                window->centreWithSize(editor->getWidth(), editor->getHeight() + window->getTitleBarHeight());
+                const bool resizable = editor->isResizable();
+                const auto editorSize = editor->getBounds();
+                window->setContentOwned(editor.release(), true);
+                if (quitting.load()) return;
+                window->setResizable(resizable, false);
+                window->centreWithSize(editorSize.getWidth(), editorSize.getHeight() + window->getTitleBarHeight());
                 window->setVisible(true);
                 if (scanMode) keepScanWindowBehind();
                 else window->toFront(true);
+                if (quitting.load()) return;
                 readyAt = unixNow();
+                readySteadyMilliseconds = steadyMilliseconds();
                 setPhase("observing");
                 report("ready", "Plug-in window opened. No license status is assumed.");
                 probeLicenseState(true);
@@ -585,6 +654,7 @@ public:
         obj->setProperty("classID", selectedClassID);
         obj->setProperty("pid", int(getpid()));
         obj->setProperty("scanMode", scanMode);
+        if (enumerationStrategy.isNotEmpty()) obj->setProperty("enumerationStrategy", enumerationStrategy);
         if (scanMode) obj->setProperty("scanDeadlineSeconds", scanDeadlineSeconds);
         obj->setProperty("phase", phase);
         obj->setProperty("lastActivePhase", lastActivePhase);
@@ -599,6 +669,12 @@ public:
         obj->setProperty("probeStaticTextNodes", probeStaticTextNodes);
         obj->setProperty("probeMaskedRegions", probeMaskedRegions);
         obj->setProperty("probePending", probePending);
+        obj->setProperty("probeCompletedInspectionCount", probeCompletedInspectionCount);
+        obj->setProperty("probeTextInspectionCount", probeTextInspectionCount);
+        obj->setProperty("processorInitialized", processorInitialized);
+        auto* diagnostics = new DynamicObject();
+        for (const auto& item : probeDiagnosticCounts) diagnostics->setProperty(item.first, item.second);
+        obj->setProperty("probeDiagnosticCounts", var(diagnostics));
         if (terminationReason.isNotEmpty()) obj->setProperty("terminationReason", terminationReason);
         Array<var> classes;
         Array<var> classEntries;
@@ -665,6 +741,10 @@ public:
     void requestQuit()
     {
         if (quitting.exchange(true)) return;
+        // A plug-in's nested modal loop can prevent JUCE from ever reaching
+        // shutdown(). Bound the scan from the moment stop is accepted, and do
+        // not extend that deadline when shutdown() later runs.
+        HostRequestPolicy::armScanShutdownSentinel(scanMode, scanShutdownSentinelArmed);
         setPhase("closing");
         report("stopping", "Closing plug-in");
         quit();
@@ -674,13 +754,14 @@ public:
     {
         quitting.store(true);
         shutdownStarted.store(true);
+        HostRequestPolicy::armScanShutdownSentinel(scanMode, scanShutdownSentinelArmed);
         stopTimer();
         setPhase("closing");
         report("stopping", "Closing plug-in");
         window.reset(); // editor must die before processor
         controls.clear();
+        if (plugin && processorInitialized) plugin->releaseResources();
         plugin.reset();
-        metadataModule.reset();
         setPhase("closed");
         report("closed", "Window closed");
         stopWatchdog.store(true);
@@ -695,7 +776,8 @@ private:
         phase = next;
         phaseStartedAt = unixNow();
         phaseStartedSteady = now;
-        if (next == "enumerating" || next == "creating_instance" || next == "creating_editor" || next == "observing")
+        if (next == "enumerating" || next == "creating_instance" || next == "initializing_processor"
+            || next == "creating_editor" || next == "observing")
             lastActivePhase = next;
     }
 
@@ -714,6 +796,11 @@ private:
         // ordinary cadence. Frame timestamps still enforce separated evidence.
         nextProbeAt = now + HostRequestPolicy::probePollDelayMilliseconds(result.pending);
         const auto diagnostic = String(result.diagnostic);
+        // Fixed diagnostic codes only; no UI text or recognized content is
+        // retained. Counts explain capture/recognition failures after teardown.
+        if (diagnostic.isNotEmpty() && diagnostic.length() <= 80
+            && (probeDiagnosticCounts.count(diagnostic) || probeDiagnosticCounts.size() < 32))
+            ++probeDiagnosticCounts[diagnostic];
         const bool diagnosticChanged = probeDiagnostic != diagnostic || probePending != result.pending || probeStaticTextNodes != result.staticTextNodes
             || probeMaskedRegions != result.maskedRegions;
         probeDiagnostic = diagnostic;
@@ -725,6 +812,12 @@ private:
         const auto sampledAt = result.sampledAtMilliseconds > 0 ? result.sampledAtMilliseconds : steadyMilliseconds();
         if (!std::isfinite(sampledAt) || sampledAt <= lastProbeSampleAt) return;
         lastProbeSampleAt = sampledAt; // A cached OCR image can never count twice.
+        if (lastState == "ready" && phase == "observing" && sampledAt >= readySteadyMilliseconds)
+        {
+            ++probeCompletedInspectionCount;
+            if (result.contentObserved) ++probeTextInspectionCount;
+            report(lastState, lastMessage);
+        }
         if (result.rule.empty())
         {
             clearLicenseCandidate();
@@ -807,7 +900,7 @@ private:
                 // The deadline never depends on the plug-in's UI event loop.
                 if (now >= orphanDeadline) _exit(72);
                 if (shutdownStarted.load() && shutdownDeadline == Clock::time_point::max())
-                    shutdownDeadline = now + std::chrono::seconds(8);
+                    shutdownDeadline = now + std::chrono::seconds(HostRequestPolicy::shutdownGraceSeconds);
                 // Also bound an editor/processor destructor that hangs after the
                 // user closes this helper's own window. No external PID is killed.
                 if (now >= shutdownDeadline) _exit(73);
@@ -847,28 +940,32 @@ private:
     var config;
     int parent = 0;
     bool scanMode = false;
+    bool initializeProcessor = true, processorInitialized = false;
     int scanDeadlineSeconds = 35;
     bool instantiating = false;
     String lastError;
     String selectedClassID, lastState, lastMessage;
+    String enumerationStrategy;
     String terminationReason;
     String phase, lastActivePhase, failureReason, probeDiagnostic;
     std::map<String, double> phaseDurations;
-    double phaseStartedAt = 0.0, phaseStartedSteady = steadyMilliseconds(), readyAt = 0.0;
+    std::map<String, int> probeDiagnosticCounts;
+    double phaseStartedAt = 0.0, phaseStartedSteady = steadyMilliseconds(), readyAt = 0.0, readySteadyMilliseconds = 0.0;
     double lastHeartbeatAt = 0.0, lastProbeSampleAt = 0.0;
     int probeStaticTextNodes = 0, probeMaskedRegions = 0;
+    int probeCompletedInspectionCount = 0, probeTextInspectionCount = 0;
     bool probePending = false;
     var licenseEvidence;
     double nextProbeAt = 0.0;
     std::string candidateRule;
     double candidateObservedAt = 0.0, candidateProbeAt = 0.0;
     std::atomic<bool> scanExpiryRequested { false };
+    std::atomic<bool> scanShutdownSentinelArmed { false };
     std::atomic<bool> quitting { false }, parentLost { false }, shutdownStarted { false }, stopWatchdog { false };
     std::thread watchdog;
     String pluginName;
     AudioPluginFormatManager formats;
     OwnedArray<PluginDescription> descriptions;
-    std::unique_ptr<VSTMetadataModule> metadataModule;
     std::unique_ptr<AudioPluginInstance> plugin;
     OwnedArray<Component> controls;
     std::unique_ptr<Window> window;
@@ -894,6 +991,9 @@ int main(int argc, char* argv[])
 #else
 #include <cassert>
 #include <iostream>
+#include <csignal>
+#include <cstdlib>
+#include <sys/wait.h>
 int main()
 {
     using namespace HostRequestPolicy;
@@ -981,6 +1081,33 @@ int main()
     assert(!isAUUnauthorized("AU", "selected-class", unauthorized + " extra text"));
     assert(!isAUUnauthorized("AU", "selected-class", "-10847"));
     assert(!isAUUnauthorized("AU", "selected-class", ""));
-    std::cout << "PASS: 64 worker PID, async timing, deadline, class identity, request bounds, mode, exact class-selection, and AU authorization policy cases\n";
+    std::atomic<bool> sentinelArmed {false};
+    assert(!armScanShutdownSentinel(false, sentinelArmed)); // Interactive mode must not arm it.
+    assert(!sentinelArmed.load());
+    const auto started = std::chrono::steady_clock::now();
+    const pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0)
+    {
+        struct StalledGlobalDestructor { ~StalledGlobalDestructor() { for (;;) pause(); } };
+        static StalledGlobalDestructor stalled;
+        assert(armScanShutdownSentinel(true, sentinelArmed));
+        assert(!armScanShutdownSentinel(true, sentinelArmed)); // shutdown must not rearm/extend it.
+        std::exit(0); // The sentinel must survive into this stalled destructor.
+    }
+    int status = 0;
+    pid_t exited = 0;
+    while ((exited = waitpid(child, &status, WNOHANG)) == 0
+           && std::chrono::steady_clock::now() - started < std::chrono::seconds(shutdownGraceSeconds + 3))
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    if (exited == 0)
+    {
+        kill(child, SIGKILL); // Test cleanup: only the child retained above.
+        waitpid(child, &status, 0);
+        assert(false && "post-shutdown sentinel did not bound the child");
+    }
+    assert(exited == child && WIFEXITED(status) && WEXITSTATUS(status) == 73);
+    assert(std::chrono::steady_clock::now() - started >= std::chrono::seconds(shutdownGraceSeconds));
+    std::cout << "PASS: 64 host-policy cases plus manual exemption, one-shot stop deadline, and bounded scan global-destructor exit\n";
 }
 #endif

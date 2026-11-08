@@ -39,6 +39,24 @@ struct ScanObservation {
     var failureReason: String = ""
     var terminationReason: String = ""
     var probeDiagnostic: String = ""
+    var probeStaticTextNodes: Int = 0
+    var probeMaskedRegions: Int = 0
+    var probeCompletedInspectionCount: Int = 0
+    var probeTextInspectionCount: Int = 0
+
+    var diagnostics: AutoScanDiagnostics {
+        func code(_ value: String) -> String {
+            value.utf8.count <= 64 && value.utf8.allSatisfy {
+                (97...122).contains($0) || (48...57).contains($0) || $0 == 95
+            } ? value : ""
+        }
+        let completed = (0...100_000).contains(probeCompletedInspectionCount) ? probeCompletedInspectionCount : 0
+        return AutoScanDiagnostics(phase: code(phase), probeDiagnostic: code(probeDiagnostic),
+            staticTextNodes: (0...4096).contains(probeStaticTextNodes) ? probeStaticTextNodes : 0,
+            maskedRegions: (0...4096).contains(probeMaskedRegions) ? probeMaskedRegions : 0,
+            completedInspectionCount: completed,
+            textInspectionCount: (0...completed).contains(probeTextInspectionCount) ? probeTextInspectionCount : 0)
+    }
 }
 
 /// The runner owns only session UUIDs retained by DeskModel, never saved PIDs.
@@ -49,11 +67,10 @@ final class AutomaticScanner: ObservableObject {
     static let readyObservationTime: TimeInterval = 6
     static let candidateObservationGrace: TimeInterval = 2.5
     static let heartbeatFreshness: TimeInterval = 8
+    static let inspectionGrace: TimeInterval = 8
     private static let failureReasons: Set<String> = ["unsupported_format", "enumeration_failed", "no_plugin_classes",
         "requested_class_missing", "instance_creation_failed", "no_custom_editor", "invalid_request"]
     private static let retryableFailureReasons: Set<String> = ["enumeration_failed", "no_plugin_classes", "instance_creation_failed"]
-    private static let inconclusiveProbeReasons: Set<String> = ["ocr_native_worker_failed", "ocr_native_worker_cleanup_failed",
-        "ocr_native_worker_protocol_error", "ocr_recognition_failed", "ocr_recognition_exception", "ocr_image_unavailable", "ocr_text_limit"]
 
     static func observationDeadline(readyAt: Date, startedAt: Date, candidate: ScanCandidate?, now: Date,
                                     startupBudget: TimeInterval = startupLimit) -> Date {
@@ -72,7 +89,7 @@ final class AutomaticScanner: ObservableObject {
     }
 
     private static func loadingTimeoutReason(_ observed: ScanObservation, now: Date) -> String {
-        let phase = ["enumerating", "creating_instance", "creating_editor"].contains(observed.phase)
+        let phase = ["enumerating", "creating_instance", "initializing_processor", "creating_editor"].contains(observed.phase)
             ? observed.phase : "loading"
         guard let beat = observed.heartbeatAt, beat.timeIntervalSince1970.isFinite,
               beat >= observed.startedAt, beat <= now else { return phase + "_deadline_no_heartbeat" }
@@ -309,8 +326,8 @@ final class AutomaticScanner: ObservableObject {
                     do {
                         let retryable = outcome == .timedOut || (outcome == .loadFailed && Self.retryableFailureReasons.contains(reason))
                         let retried = automaticallyRetryFailures && retryable
-                            ? try run.retryCurrent(outcome: outcome, reason: reason, checkedAt: now) : false
-                        if !retried { try run.finishCurrent(outcome: outcome, reason: reason, checkedAt: now) }
+                            ? try run.retryCurrent(outcome: outcome, reason: reason, checkedAt: now, diagnostics: observed.diagnostics) : false
+                        if !retried { try run.finishCurrent(outcome: outcome, reason: reason, checkedAt: now, diagnostics: observed.diagnostics) }
                     }
                     catch { fail(error.localizedDescription); continue }
                     guard commit(run, worker: worker) else { continue }
@@ -331,6 +348,17 @@ final class AutomaticScanner: ObservableObject {
                     let deadline = Self.observationDeadline(readyAt: ready, startedAt: observed.startedAt,
                                                             candidate: candidate, now: now, startupBudget: budget)
                     if now >= deadline {
+                        // Let an in-flight first/second capture finish, but keep
+                        // an absolute bound. A blank capture is not inspected UI.
+                        let incomplete = (["ocr_no_supported_status", "ax_no_supported_status"].contains(observed.probeDiagnostic)
+                                          && observed.probeCompletedInspectionCount < 2)
+                            || observed.probeDiagnostic == "ocr_pending"
+                            || observed.probeDiagnostic == "ocr_sampling_interval"
+                        if incomplete, !observed.probeDiagnostic.isEmpty,
+                           now < min(ready.addingTimeInterval(Self.readyObservationTime + Self.inspectionGrace),
+                                     observed.startedAt.addingTimeInterval(budget + Self.readyObservationTime + Self.inspectionGrace)) {
+                            continue
+                        }
                         if observed.probeDiagnostic == "ocr_time_budget_exceeded" {
                             // A cold OCR engine can exceed its own budget while
                             // the editor remains responsive. Preserve that
@@ -340,9 +368,17 @@ final class AutomaticScanner: ObservableObject {
                         } else if let beat = observed.heartbeatAt, beat >= observed.startedAt, beat <= now,
                            now.timeIntervalSince(beat) > Self.heartbeatFreshness {
                             requestEnd(worker, outcome: .timedOut, reason: "observing_heartbeat_stalled")
+                        } else if observed.diagnostics.hasInspectedDisplay,
+                                  candidate == nil,
+                                  ["ocr_no_supported_status", "ax_no_supported_status"].contains(observed.probeDiagnostic) {
+                            requestEnd(worker, outcome: .noActivationDetected, reason: "inspected_no_activation_status")
                         } else {
-                            let reason = Self.inconclusiveProbeReasons.contains(observed.probeDiagnostic)
-                                ? observed.probeDiagnostic : "no_supported_explicit_license_status"
+                            // Retain the capture failure, instead of collapsing
+                            // every unreadable/blank/pending editor into one code.
+                            let code = observed.probeDiagnostic
+                            let safeCode = !code.isEmpty && code.utf8.count <= 64
+                                && code.utf8.allSatisfy { (97...122).contains($0) || (48...57).contains($0) || $0 == 95 }
+                            let reason = safeCode ? code : "no_completed_license_inspection"
                             requestEnd(worker, outcome: .inconclusive, reason: reason)
                         }
                     }
@@ -407,10 +443,13 @@ final class AutomaticScanner: ObservableObject {
     }
 
     @discardableResult func writeReport() -> Bool {
-        var lines = ["Product,Vendor,Format,Result,Reason,Path,ClassID"]
+        var lines = ["Product,Vendor,Format,Result,Reason,Path,ClassID,Phase,ProbeDiagnostic,CompletedInspections,TextInspections"]
         for result in results.sorted(by: { $0.task.productName.localizedStandardCompare($1.task.productName) == .orderedAscending }) {
             let t = result.task
-            lines.append([t.productName, t.entry.vendor, t.entry.format, result.outcome.title, result.reason, t.entry.path, t.classID].map(Self.csvField).joined(separator: ","))
+            let d = result.diagnostics
+            lines.append([t.productName, t.entry.vendor, t.entry.format, result.outcome.title, result.reason, t.entry.path, t.classID,
+                          d?.phase ?? "", d?.probeDiagnostic ?? "", d.map { String($0.completedInspectionCount) } ?? "",
+                          d.map { String($0.textInspectionCount) } ?? ""].map(Self.csvField).joined(separator: ","))
         }
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

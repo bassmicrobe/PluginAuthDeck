@@ -57,6 +57,10 @@ struct HostSession: Identifiable {
     var candidate: ScanCandidate?
     var heartbeatAt: Date?
     var probeDiagnostic = ""
+    var probeStaticTextNodes = 0
+    var probeMaskedRegions = 0
+    var probeCompletedInspectionCount = 0
+    var probeTextInspectionCount = 0
     var phase = ""
     var failureReason = ""
     var terminationReason = ""
@@ -223,7 +227,11 @@ final class DeskModel: ObservableObject {
                 evidenceRule: license?.evidenceRule ?? "user_confirmed", candidate: session.candidate,
                 heartbeatAt: session.heartbeatAt, phase: session.phase,
                 failureReason: session.failureReason, terminationReason: session.terminationReason,
-                probeDiagnostic: session.probeDiagnostic)
+                probeDiagnostic: session.probeDiagnostic,
+                probeStaticTextNodes: session.probeStaticTextNodes,
+                probeMaskedRegions: session.probeMaskedRegions,
+                probeCompletedInspectionCount: session.probeCompletedInspectionCount,
+                probeTextInspectionCount: session.probeTextInspectionCount)
         }
         scanner.isKnown = { [weak self] task in
             self?.records(for: task.entry).contains { $0.classID == task.classID } ?? false
@@ -364,7 +372,7 @@ final class DeskModel: ObservableObject {
         var payload: [String: Any] = ["name": entry.name, "format": entry.format,
             "identifier": entry.identifier, "path": entry.path, "classID": classID,
             "mode": automatic ? "scan" : "manual", "parentPID": parentPID]
-        if automatic { payload["scanDeadlineSeconds"] = scanBudgetSeconds == 60 ? 70 : 35 }
+        if automatic { payload["scanDeadlineSeconds"] = scanBudgetSeconds == 60 ? 80 : 45 }
         return payload
     }
 
@@ -465,7 +473,7 @@ final class DeskModel: ObservableObject {
             updated[i].lifecycle.receive(report, heartbeat: heartbeat)
             catalogChanged = receiveHostMetadata(report, session: &updated[i]) || catalogChanged
         }
-        if zip(sessions, updated).contains(where: { $0.lifecycle != $1.lifecycle || $0.knownClasses != $1.knownClasses || $0.classID != $1.classID || $0.evidenceObservedAt != $1.evidenceObservedAt || $0.products != $1.products || $0.readyAt != $1.readyAt || $0.candidate != $1.candidate || $0.heartbeatAt != $1.heartbeatAt || $0.phase != $1.phase || $0.failureReason != $1.failureReason || $0.terminationReason != $1.terminationReason || $0.probeDiagnostic != $1.probeDiagnostic }) {
+        if zip(sessions, updated).contains(where: { $0.lifecycle != $1.lifecycle || $0.knownClasses != $1.knownClasses || $0.classID != $1.classID || $0.evidenceObservedAt != $1.evidenceObservedAt || $0.products != $1.products || $0.readyAt != $1.readyAt || $0.candidate != $1.candidate || $0.heartbeatAt != $1.heartbeatAt || $0.phase != $1.phase || $0.failureReason != $1.failureReason || $0.terminationReason != $1.terminationReason || $0.probeDiagnostic != $1.probeDiagnostic || $0.probeStaticTextNodes != $1.probeStaticTextNodes || $0.probeMaskedRegions != $1.probeMaskedRegions || $0.probeCompletedInspectionCount != $1.probeCompletedInspectionCount || $0.probeTextInspectionCount != $1.probeTextInspectionCount }) {
             sessions = updated
         }
         if catalogChanged { saveInventoryCache() }
@@ -479,6 +487,16 @@ final class DeskModel: ObservableObject {
             if let code = report[key] as? String, code.utf8.count <= 64,
                code.utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) || $0 == 95 }) {
                 session[keyPath: path] = code
+            }
+        }
+        for (key, path) in [("probeStaticTextNodes", \HostSession.probeStaticTextNodes),
+                            ("probeMaskedRegions", \HostSession.probeMaskedRegions),
+                            ("probeCompletedInspectionCount", \HostSession.probeCompletedInspectionCount),
+                            ("probeTextInspectionCount", \HostSession.probeTextInspectionCount)] {
+            if let number = report[key] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+               number.doubleValue.isFinite, number.doubleValue >= 0, number.doubleValue <= 1_000_000,
+               number.doubleValue == Double(number.intValue) {
+                session[keyPath: path] = number.intValue
             }
         }
         if session.readyAt == nil, let ready = report["readyAt"] as? Double, ready.isFinite,
@@ -1192,12 +1210,18 @@ struct AutomaticScanPanel: View {
                 HStack {
                     Text("\(scanner.completedCount) / \(scanner.totalCount) 件チェック済み")
                     Text("未認証検出 \(scanner.unactivatedCount) 件")
+                    Text("未認証表示なし \(counts[.noActivationDetected, default: 0])")
                     Text("未判定 \(counts[.inconclusive, default: 0]) · 読込失敗 \(counts[.loadFailed, default: 0]) · 時間切れ \(counts[.timedOut, default: 0])")
                         .foregroundColor(.secondary)
                     Spacer()
                     Text(scanner.isComplete ? "完了" : scanner.isStopping ? "停止中" : scanner.isRunning ? (retrying ? "再試行中（1件ずつ）" : "実行中（最大2件）") : "一時停止")
                 }.font(.system(size: 11))
                 ProgressView(value: Double(scanner.completedCount), total: Double(max(1, scanner.totalCount)))
+                let uadDisabled = scanner.results.filter { $0.diagnostics?.probeDiagnostic == "uad_dsp_disabled" }.count
+                if uadDisabled > 0 {
+                    Text("UAD DSPの無効表示 \(uadDisabled) 件：UAD Meterでドライバ・接続機器・ライセンスを確認してください。無効表示だけでは未認証と断定しません。")
+                        .font(.system(size: 11)).foregroundColor(.orange)
+                }
                 if scanner.isRunning {
                     Text(scanner.runs.compactMap { $0.current.map { $0.productName + " (" + $0.entry.format + ")" } }.joined(separator: " ／ "))
                         .font(.system(size: 10)).foregroundColor(.secondary).lineLimit(1)
@@ -1213,7 +1237,7 @@ struct AutomaticScanPanel: View {
                     Button("記録を再読み込み") { scanner.reload() }.disabled(scanner.hasActiveHosts)
                 }.font(.system(size: 11))
             } else {
-                Text(scanner.message.isEmpty ? "検索や形式の絞り込みに関係なく未確認の全製品を調べます。1件ずつの操作は不要です。判定できない製品を認証済みとは扱いません。" : scanner.message)
+                Text(scanner.message.isEmpty ? "未確認の全製品を自動で調べます。「未認証表示なし」は画面内で未認証表示を検出しなかった結果で、ライセンス保有の証明ではありません。" : scanner.message)
                     .font(.system(size: 11)).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             }
         }.padding(.horizontal, 24).padding(.vertical, 12)

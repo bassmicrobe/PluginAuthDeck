@@ -80,6 +80,39 @@ struct AutoScanTests {
               "last task completes the run")
         run.resume(); check(run.status == .complete && run.beginNext() == nil, "completed runs do not restart automatically")
         check(!AutoScanOutcome.allCases.map(\.rawValue).contains("activated"), "absence of a warning is never represented as activated")
+        check(AutoScanOutcome.noActivationDetected.title == "未認証表示なし",
+              "an inspected display without an activation warning is not called licensed")
+
+        let inspection = AutoScanDiagnostics(phase: "observing", probeDiagnostic: "ocr_no_supported_status",
+            staticTextNodes: 12, maskedRegions: 3, completedInspectionCount: 3, textInspectionCount: 2)
+        var inspectedRun = AutoScanRun(tasks: [classOne])
+        inspectedRun.resume(); _ = inspectedRun.beginNext()
+        let beforeInspected = inspectedRun
+        expectError("a negative display result needs actual completed inspections") {
+            try inspectedRun.finishCurrent(outcome: .noActivationDetected, reason: "no_activation_display")
+        }
+        check(inspectedRun == beforeInspected, "rejected evidence does not consume the current task")
+        for invalidInspection in [
+            AutoScanDiagnostics(phase: "observing", completedInspectionCount: 1, textInspectionCount: 1),
+            AutoScanDiagnostics(phase: "observing", completedInspectionCount: 2, textInspectionCount: 0),
+            AutoScanDiagnostics(phase: "observing", completedInspectionCount: 2, textInspectionCount: 3),
+            AutoScanDiagnostics(phase: "observing", completedInspectionCount: -1, textInspectionCount: 0),
+            AutoScanDiagnostics(phase: "observing", staticTextNodes: 4097, completedInspectionCount: 2, textInspectionCount: 2),
+            AutoScanDiagnostics(phase: "observing", probeDiagnostic: "raw UI text must never be persisted", completedInspectionCount: 2, textInspectionCount: 2)
+        ] {
+            expectError("incomplete or invalid inspection metadata cannot prove a negative display check") {
+                try inspectedRun.finishCurrent(outcome: .noActivationDetected, reason: "no_activation_display",
+                                               diagnostics: invalidInspection)
+            }
+        }
+        try inspectedRun.finishCurrent(outcome: .noActivationDetected, reason: "no_activation_display",
+                                       diagnostics: inspection)
+        let inspectedStore = try AutoScanStore(directory: root.appendingPathComponent("Inspected"))
+        try inspectedStore.save(inspectedRun)
+        let inspectedReload = try AutoScanStore(directory: root.appendingPathComponent("Inspected"))
+        check(inspectedReload.run?.results.first?.diagnostics == inspection
+            && inspectedReload.run?.results.first?.outcome == .noActivationDetected,
+            "safe inspection metadata and its limited result survive reload")
 
         var auOne = entry("Shared AU", format: "AU")
         auOne.id += "|aumu,one,Acme"
@@ -101,8 +134,9 @@ struct AutoScanTests {
         var retryRun = AutoScanRun(tasks: [initial, secondModule])
         retryRun.resume(); _ = retryRun.beginNext()
         try retryRun.identifyCurrent(classID: "one", productName: "Product One")
+        let retryDiagnostics = AutoScanDiagnostics(phase: "creating_instance", probeDiagnostic: "ocr_pending")
         check(try retryRun.retryCurrent(outcome: .timedOut, reason: "creating_instance_heartbeat_stalled",
-            checkedAt: Date(timeIntervalSince1970: 100)), "first transient failure can be queued once")
+            checkedAt: Date(timeIntervalSince1970: 100), diagnostics: retryDiagnostics), "first transient failure can be queued once")
         check(retryRun.completedCount == 0 && retryRun.totalCount == 2 && retryRun.current == nil,
             "retry records an attempt without adding a completed product")
         check(retryRun.beginNext() == secondModule, "ordinary work runs before the retry pass")
@@ -123,6 +157,8 @@ struct AutoScanTests {
         var retryReload = try AutoScanStore(directory: root.appendingPathComponent("Retry")).run!
         check(retryReload.status == .paused && retryReload.pending.first?.previousAttempts?.count == 1,
             "paused/reloaded retries retain their history without starting a host")
+        check(retryReload.pending.first?.previousAttempts?.first?.diagnostics == retryDiagnostics,
+              "first-attempt diagnostics survive retry queue persistence")
         retryReload.resume(); _ = retryReload.beginNext()
         check(try !retryReload.retryCurrent(outcome: .loadFailed, reason: "instance_creation_failed"),
             "second failure cannot schedule an unbounded third attempt")
@@ -138,6 +174,15 @@ struct AutoScanTests {
         let legacyTask = try JSONDecoder().decode(AutoScanTask.self, from: legacyTaskBytes)
         check(legacyTask.previousAttempts == nil && !legacyTask.isRetry && legacyTask.launchBudgetSeconds == 25,
             "older task JSON without attempt metadata retains the ordinary budget")
+        let legacyResultBytes = try legacyEncoder.encode(run.results[0])
+        let legacyResultJSON = try JSONSerialization.jsonObject(with: legacyResultBytes) as! [String: Any]
+        check(legacyResultJSON["diagnostics"] == nil, "legacy records omit optional inspection metadata")
+        let legacyResult = try JSONDecoder().decode(AutoScanResult.self, from: legacyResultBytes)
+        check(legacyResult.diagnostics == nil && legacyResult.outcome == .needsActivation,
+              "old results lacking diagnostics decode without inventing inspection evidence")
+        let legacyAttempt = try JSONDecoder().decode(AutoScanAttempt.self,
+            from: Data("{\"outcome\":\"timedOut\",\"reason\":\"loading_heartbeat_stalled\",\"checkedAt\":100}".utf8))
+        check(legacyAttempt.diagnostics == nil, "old retry metadata without diagnostics remains readable")
         let repeatedAttempt = AutoScanAttempt(outcome: .timedOut, reason: "loading_heartbeat_stalled", checkedAt: Date())
         let invalidRetry = AutoScanRun(tasks: [AutoScanTask(entry: bundle, previousAttempts: [repeatedAttempt, repeatedAttempt])])
         expectError("checkpoints reject an unbounded retry history") { try retryStore.save(invalidRetry) }
@@ -195,6 +240,15 @@ struct AutoScanTests {
         let invalid = try JSONSerialization.data(withJSONObject: ["version": 1, "run": invalidRun])
         try invalid.write(to: invalidDirectory.appendingPathComponent("autoscan-state.json"))
         expectError("complete run with pending tasks is invalid") { _ = try AutoScanStore(directory: invalidDirectory) }
+        var invalidInspected = try JSONSerialization.jsonObject(with: encoder.encode(inspectedRun)) as! [String: Any]
+        var inspectedResults = invalidInspected["results"] as! [[String: Any]]
+        inspectedResults[0].removeValue(forKey: "diagnostics")
+        invalidInspected["results"] = inspectedResults
+        try JSONSerialization.data(withJSONObject: ["version": 1, "run": invalidInspected])
+            .write(to: invalidDirectory.appendingPathComponent("autoscan-state.json"))
+        expectError("saved negative display results without inspection evidence are rejected") {
+            _ = try AutoScanStore(directory: invalidDirectory)
+        }
         invalidRun = try JSONSerialization.jsonObject(with: encoder.encode(run)) as! [String: Any]
         let future = try JSONSerialization.data(withJSONObject: ["version": 2, "run": invalidRun])
         try future.write(to: invalidDirectory.appendingPathComponent("autoscan-state.json"))

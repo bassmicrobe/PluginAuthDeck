@@ -41,11 +41,12 @@ struct AutoScanTask: Codable, Identifiable, Equatable {
 }
 
 enum AutoScanOutcome: String, Codable, CaseIterable {
-    case needsActivation, inconclusive, loadFailed, timedOut, changed, skipped
+    case needsActivation, noActivationDetected, inconclusive, loadFailed, timedOut, changed, skipped
 
     var title: String {
         switch self {
         case .needsActivation: return "未認証"
+        case .noActivationDetected: return "未認証表示なし"
         case .inconclusive: return "未判定"
         case .loadFailed: return "読み込み失敗"
         case .timedOut: return "時間切れ"
@@ -55,15 +56,45 @@ enum AutoScanOutcome: String, Codable, CaseIterable {
     }
 }
 
+/// Bounded operational evidence only. These counters distinguish an inspected
+/// editor from a missing/unfinished capture, without retaining any UI content.
+/// A negative display check never asserts that a product is licensed.
+struct AutoScanDiagnostics: Codable, Equatable {
+    var phase: String = ""
+    var probeDiagnostic: String = ""
+    var staticTextNodes: Int = 0
+    var maskedRegions: Int = 0
+    var completedInspectionCount: Int = 0
+    var textInspectionCount: Int = 0
+
+    var hasInspectedDisplay: Bool {
+        completedInspectionCount >= 2 && textInspectionCount >= 2
+    }
+
+    fileprivate var isValid: Bool {
+        func code(_ value: String) -> Bool {
+            value.utf8.count <= 128 && value.utf8.allSatisfy {
+                (97...122).contains($0) || (48...57).contains($0) || $0 == 95
+            }
+        }
+        return code(phase) && code(probeDiagnostic)
+            && (0...4096).contains(staticTextNodes) && (0...4096).contains(maskedRegions)
+            && (0...100_000).contains(completedInspectionCount)
+            && (0...completedInspectionCount).contains(textInspectionCount)
+    }
+}
+
 struct AutoScanAttempt: Codable, Equatable {
     var outcome: AutoScanOutcome
     var reason: String
     var checkedAt: Date
+    var diagnostics: AutoScanDiagnostics? = nil
 
     fileprivate var isValid: Bool {
         [.loadFailed, .timedOut].contains(outcome) && checkedAt.timeIntervalSince1970.isFinite
             && !reason.isEmpty && reason.utf8.count <= 128
             && reason.utf8.allSatisfy { (97...122).contains($0) || (48...57).contains($0) || $0 == 95 }
+            && (diagnostics?.isValid ?? true)
     }
 }
 
@@ -74,14 +105,17 @@ struct AutoScanResult: Codable, Identifiable, Equatable {
     // key, screenshot, or the complete text scraped from a plug-in window.
     var reason: String
     var checkedAt: Date
+    var diagnostics: AutoScanDiagnostics?
 
     var id: String { task.id }
 
-    init(task: AutoScanTask, outcome: AutoScanOutcome, reason: String, checkedAt: Date = Date()) {
+    init(task: AutoScanTask, outcome: AutoScanOutcome, reason: String, checkedAt: Date = Date(),
+         diagnostics: AutoScanDiagnostics? = nil) {
         self.task = task
         self.outcome = outcome
         self.reason = reason
         self.checkedAt = canonicalScanDate(checkedAt)
+        self.diagnostics = diagnostics
     }
 }
 
@@ -202,11 +236,16 @@ struct AutoScanRun: Codable, Equatable, Identifiable {
         updatedAt = canonicalScanDate()
     }
 
-    mutating func finishCurrent(outcome: AutoScanOutcome, reason: String, checkedAt: Date = Date()) throws {
+    mutating func finishCurrent(outcome: AutoScanOutcome, reason: String, checkedAt: Date = Date(),
+                                diagnostics: AutoScanDiagnostics? = nil) throws {
         guard let task = current else { throw AutoScanError.noCurrentTask }
-        guard checkedAt.timeIntervalSince1970.isFinite else { throw AutoScanError.invalidState }
+        guard checkedAt.timeIntervalSince1970.isFinite, diagnostics?.isValid ?? true,
+              outcome != .noActivationDetected || diagnostics?.hasInspectedDisplay == true else {
+            throw AutoScanError.invalidState
+        }
         guard !results.contains(where: { $0.id == task.id }) else { throw AutoScanError.alreadyCompleted }
-        results.append(AutoScanResult(task: task, outcome: outcome, reason: reason, checkedAt: checkedAt))
+        results.append(AutoScanResult(task: task, outcome: outcome, reason: reason, checkedAt: checkedAt,
+                                      diagnostics: diagnostics))
         current = nil
         if pending.isEmpty { status = .complete }
         updatedAt = canonicalScanDate()
@@ -215,10 +254,12 @@ struct AutoScanRun: Codable, Equatable, Identifiable {
     // Called only after the owned host has actually exited. Pauses, ownership
     // failures and storage conflicts must not consume a retry or create a result.
     @discardableResult
-    mutating func retryCurrent(outcome: AutoScanOutcome, reason: String, checkedAt: Date = Date()) throws -> Bool {
+    mutating func retryCurrent(outcome: AutoScanOutcome, reason: String, checkedAt: Date = Date(),
+                               diagnostics: AutoScanDiagnostics? = nil) throws -> Bool {
         guard var task = current else { throw AutoScanError.noCurrentTask }
         guard !task.isRetry, [.loadFailed, .timedOut].contains(outcome) else { return false }
-        let attempt = AutoScanAttempt(outcome: outcome, reason: reason, checkedAt: canonicalScanDate(checkedAt))
+        let attempt = AutoScanAttempt(outcome: outcome, reason: reason, checkedAt: canonicalScanDate(checkedAt),
+                                      diagnostics: diagnostics)
         guard attempt.isValid else { throw AutoScanError.invalidState }
         task.previousAttempts = [attempt]
         guard !pending.contains(where: { $0.id == task.id }), !results.contains(where: { $0.id == task.id }) else {
@@ -243,7 +284,9 @@ struct AutoScanRun: Codable, Equatable, Identifiable {
         let tasks = pending + results.map(\.task) + (current.map { [$0] } ?? [])
         guard startedAt.timeIntervalSince1970.isFinite, updatedAt.timeIntervalSince1970.isFinite,
               tasks.allSatisfy(\.isValid), Set(tasks.map(\.id)).count == tasks.count,
-              results.allSatisfy({ $0.checkedAt.timeIntervalSince1970.isFinite }),
+              results.allSatisfy({ $0.checkedAt.timeIntervalSince1970.isFinite
+                  && ($0.diagnostics?.isValid ?? true)
+                  && ($0.outcome != .noActivationDetected || $0.diagnostics?.hasInspectedDisplay == true) }),
               current == nil || status == .running,
               status != .complete || (pending.isEmpty && current == nil) else { throw AutoScanError.invalidState }
     }

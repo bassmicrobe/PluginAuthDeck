@@ -105,7 +105,7 @@ def check_worker_protocol(root, name, payload, expected_code, keep_input_open=Fa
             assert set(response) == {"version", "rule", "diagnostic", "staticTextNodes"}, name
             assert type(response["version"]) is int and response["version"] == 1, name
             assert response["rule"] == "", (name, "blank synthetic pixels cannot prove activation status")
-            assert response["diagnostic"] in {"ocr_no_supported_status", "ocr_image_unavailable",
+            assert response["diagnostic"] in {"ocr_no_supported_status", "ocr_no_text", "ocr_image_unavailable",
                 "ocr_time_budget_exceeded", "ocr_recognition_failed", "ocr_recognition_exception", "ocr_text_limit"}, name
             assert type(response["staticTextNodes"]) is int and 0 <= response["staticTextNodes"] <= 256, name
         else:
@@ -240,5 +240,18 @@ with tempfile.TemporaryDirectory(prefix="plugin-auth-host-input-") as directory:
         assert status["failureReason"] == "invalid_request" and status["lastActivePhase"] == "", status
         assert not (root / "heartbeat.json").exists()
 
-print("PASS: 51 pre-UI rejection cases including 34 worker/warmup arguments with open stdin; no worker files or plug-in load")
-print("PASS: 79 total cases (1 synthetic warmup, 27 OCR protocol, 51 pre-UI rejection)")
+    # Initialization may be disabled only with an explicit boolean, never a
+    # truthy string/number or a malformed object interpreted as a default.
+    for initialization in (None, 0, 1, "false", [], {}):
+        (root / "status.json").unlink()
+        request.write_text(json.dumps({"name": "Invalid initialization fixture", "parentPID": os.getpid(),
+                                       "mode": "scan", "initializeProcessor": initialization,
+                                       "format": "VST3", "identifier": "/nonexistent.vst3"}))
+        assert invoke(["--request", str(request)]) == 1
+        status = json.loads((root / "status.json").read_text())
+        assert status["state"] == "closed" and status["error"] == "Invalid processor initialization option", status
+        assert status["failureReason"] == "invalid_request" and status["lastActivePhase"] == "", status
+        assert not (root / "heartbeat.json").exists()
+
+print("PASS: 57 pre-UI rejection cases including 34 worker/warmup arguments with open stdin; no worker files or plug-in load")
+print("PASS: 85 total cases (1 synthetic warmup, 27 OCR protocol, 57 pre-UI rejection)")

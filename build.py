@@ -21,8 +21,8 @@ import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parent
 BUNDLE_ID = 'local.plugin-auth-desk'
-VERSION = '1.4.0'
-BUILD_NUMBER = '8'
+VERSION = '1.4.1'
+BUILD_NUMBER = '9'
 JUCE_COMMIT = '72782788ce18c2d4d760b28e0921d6ffc6431102'
 JUCE_TREE = 'd23fca239ebee89df5e81718a2fe16434b53118b'
 # Explicit source distribution: never recursively add the project directory.

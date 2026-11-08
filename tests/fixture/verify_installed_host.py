@@ -78,8 +78,12 @@ def main():
     parser.add_argument('--output', type=Path, help='JSON report path; default: this checkout\'s ignored results directory')
     parser.add_argument('--factory-metadata', action='store_true', help='Remove only the staged moduleinfo to exercise factory metadata without sibling instantiation')
     parser.add_argument('--ocr-only', action='store_true', help='Use painted fixture text with no accessibility text node')
+    parser.add_argument('--editor-only', action='store_true', help='Exercise the explicit initialization opt-out without audio processing')
+    parser.add_argument('--cancel-during-initialization', action='store_true', help='Request stop from a synthetic nested initialization loop; require no editor or ready state afterward')
     parser.add_argument('--architecture', choices=['arm64', 'x86_64'], default='arm64', help='Run the synthetic plug-in host natively or under Rosetta')
     args = parser.parse_args()
+    if args.cancel_during_initialization and (args.editor_only or args.ocr_only or args.variant != 'normal'):
+        parser.error('--cancel-during-initialization requires ordinary initialization and no OCR/delay variant')
     fixture_root = Path(__file__).resolve().parent
     repository = fixture_root.parents[1]
     suffix = '' if args.variant == 'normal' else '-' + args.variant
@@ -105,6 +109,8 @@ def main():
         'variant': args.variant,
         'factoryMetadata': args.factory_metadata,
         'ocrOnly': args.ocr_only,
+        'editorOnly': args.editor_only,
+        'cancelDuringInitialization': args.cancel_during_initialization,
         'architecture': args.architecture,
         'startedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'host': str(host),
@@ -160,6 +166,7 @@ def main():
             'path': str(staged_plugin),
             'parentPID': os.getpid(),
             'mode': 'scan',
+            'initializeProcessor': not args.editor_only,
         }
         request_path = directory / 'request.json'
         request_path.write_text(json.dumps(request), encoding='utf-8')
@@ -169,6 +176,9 @@ def main():
         environment['PAD_FIXTURE_PAINTED'] = '1' if args.ocr_only else '0'
         environment.pop('PAD_FIXTURE_DELAY_MS', None)
         environment.pop('PAD_FIXTURE_CLEAR_REQUEST', None)
+        environment.pop('PAD_FIXTURE_QUIT_DURING_INITIALIZATION', None)
+        if args.cancel_during_initialization:
+            environment['PAD_FIXTURE_QUIT_DURING_INITIALIZATION'] = str(directory / 'quit.request')
         if args.variant != 'normal':
             environment['PAD_FIXTURE_DELAY_MS'] = '2200'
         clear_request = directory / 'clear-fixture-label.request'
@@ -188,7 +198,7 @@ def main():
         candidate_seen = None
         cleanup = 'already-exited'
         try:
-            while time.monotonic() - start < 30:
+            while time.monotonic() - start < (12 if args.cancel_during_initialization else 30):
                 if (os.environ.get('FIXTURE_SAMPLE') == '1' and not sampled
                         and time.monotonic() - start >= 5 and process.poll() is None):
                     sampled = True
@@ -298,12 +308,45 @@ def main():
             if events.count('processor_created') != 1 or events.count('editor_created') != 1:
                 report['result'] = 'failed'
                 report['failureReason'] = 'selected_processor_and_editor_must_be_created_exactly_once'
-            if 'audio_prepared' in events or 'audio_processed' in events:
+            if 'audio_processed' in events:
                 report['result'] = 'failed'
                 report['failureReason'] = 'host_started_audio_processing'
+            if args.editor_only:
+                if 'processor_initialized' in events or events.count('editor_before_initialization') != 1 or latest.get('processorInitialized') is not False:
+                    report['result'] = 'failed'
+                    report['failureReason'] = 'initialization_opt_out_was_ignored'
+            elif (events.count('processor_initialized') != 1
+                  or events.count('editor_created') != 1
+                  or 'editor_before_initialization' in events
+                  or latest.get('processorInitialized') is not True
+                  or events.index('processor_initialized') > events.index('editor_created')
+                  or 'processor_released' not in events):
+                report['result'] = 'failed'
+                report['failureReason'] = 'processor_must_initialize_before_editor_and_release_without_rendering'
             if latest.get('phase') != 'observing' or latest.get('lastActivePhase') != 'observing' or not latest.get('readyAt'):
                 report['result'] = 'failed'
                 report['failureReason'] = 'missing_ready_phase_diagnostics'
+            if latest.get('enumerationStrategy') != ('vst3_factory' if args.factory_metadata else 'vst3_moduleinfo'):
+                report['result'] = 'failed'
+                report['failureReason'] = 'expected_metadata_enumeration_path_was_not_used'
+            if args.cancel_during_initialization:
+                # This mode deliberately never has an editor/ready phase.
+                # The fixture pumps the host's stop timer inside prepareToPlay,
+                # reproducing a vendor's nested native initialization loop.
+                cancelled = (events.count('processor_created') == 1
+                             and events.count('processor_initialized') == 1
+                             and events.count('stop_requested_during_initialization') == 1
+                             and events.count('initialization_returned_after_nested_loop') == 1
+                             and 'editor_created' not in events and 'audio_processed' not in events
+                             and latest.get('lastActivePhase') == 'initializing_processor'
+                             and not latest.get('readyAt')
+                             and all(item.get('state') != 'ready' and not item.get('licenseEvidence') for item in timeline)
+                             and report['elapsedSeconds'] < 12 and process.returncode in (0, 73))
+                report['result'] = 'passed' if cancelled else 'failed'
+                if cancelled:
+                    report.pop('failureReason', None)
+                else:
+                    report['failureReason'] = 'stop_during_initialization_created_editor_or_reached_ready'
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print(json.dumps({key: report[key] for key in ['result', 'elapsedSeconds', 'childPID', 'cleanup', 'exitCode', 'childExited']}))

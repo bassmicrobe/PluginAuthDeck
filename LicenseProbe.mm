@@ -139,7 +139,7 @@ bool validRule(NSString* rule)
 
 bool validOCRDiagnostic(NSString* diagnostic)
 {
-    return [diagnostic isKindOfClass:NSString.class] && [@[@"ocr_matched", @"ocr_no_supported_status",
+    return [diagnostic isKindOfClass:NSString.class] && [@[@"ocr_matched", @"ocr_no_supported_status", @"ocr_no_text", @"uad_dsp_disabled",
         @"ocr_image_unavailable", @"ocr_time_budget_exceeded", @"ocr_recognition_failed",
         @"ocr_recognition_exception", @"ocr_text_limit"] containsObject:diagnostic];
 }
@@ -289,6 +289,8 @@ ProbeResult recognizeInNativeWorker(NSImage* image, std::string_view productName
     result.rule = rule.UTF8String;
     result.diagnostic = diagnostic.UTF8String;
     result.staticTextNodes = (std::size_t)count.unsignedIntegerValue;
+    result.contentObserved = result.staticTextNodes > 0
+        && (result.diagnostic == "ocr_matched" || result.diagnostic == "ocr_no_supported_status");
     return result;
 }
 
@@ -341,23 +343,48 @@ bool protectedObject(id object)
 struct Signals
 {
     bool prompt = false, action = false, dismiss = false, help = false, licensed = false;
+    bool activationRequired = false;
+    bool uadDSPDisabled = false;
     std::size_t inputs = 0;
     std::string explicitRule;
+    std::string messageRule;
 };
 
 void textSignals(Signals& signals, id candidate, std::string_view product, bool button = false)
 {
-    if (![candidate isKindOfClass:NSString.class] || [candidate length] > 256) return;
+    if (![candidate isKindOfClass:NSString.class] || [candidate length] > 1024) return;
+    if (!button)
+    {
+        // Native alert message labels often contain a status sentence followed
+        // by recovery instructions. Keep the first sentence as tentative only:
+        // it additionally needs activation + dismissal controls in the same
+        // scope, unlike a complete standalone status. Never search arbitrary
+        // substrings in help paragraphs or retain their original text.
+        const NSRange boundary = [candidate rangeOfCharacterFromSet:
+            [NSCharacterSet characterSetWithCharactersInString:@".!\n"]];
+        if (boundary.location != NSNotFound && boundary.location > 0 && boundary.location <= 256)
+        {
+            const auto rule = matchStatusText(utf8([candidate substringToIndex:boundary.location]), product);
+            if (signals.messageRule.empty() && !rule.empty()) signals.messageRule = rule;
+        }
+    }
+    if ([candidate length] > 256) return;
     NSString* text = normalized(utf8(candidate));
     if (text == nil) return;
+    // A DSP plug-in's DISABLED button can mean missing hardware, driver,
+    // resources, or a license. Preserve this obstruction without guessing
+    // which one; it must not look like a successfully inspected normal editor.
+    signals.uadDSPDisabled |= [normalized(product) hasPrefix:@"uad "] && [text isEqualToString:@"disabled"];
     if (button)
     {
-        signals.action |= isOneOf(text, @[@"activate", @"activate license", @"activate licence", @"authorize",
+        signals.action |= isOneOf(text, @[@"activate", @"activate license", @"activate licence", @"authorize", @"authorize now",
                                           @"register", @"unlock", @"認証", @"アクティベート", @"登録"]);
-        signals.dismiss |= isOneOf(text, @[@"cancel", @"close", @"continue demo", @"continue trial", @"キャンセル"]);
+        signals.dismiss |= isOneOf(text, @[@"cancel", @"close", @"quit", @"continue demo", @"continue trial", @"キャンセル"]);
         return;
     }
     if ([text hasSuffix:@":"]) text = [text substringToIndex:text.length - 1];
+    signals.activationRequired |= isOneOf(text, @[@"activation required", @"authorization required",
+        @"license activation required", @"plug-in activation required"]);
     signals.prompt |= isOneOf(text, @[@"enter license key", @"enter your license key", @"please enter your license key",
         @"enter a license key", @"license key", @"enter serial number", @"enter your serial number", @"serial number",
         @"registration code", @"activation code", @"enter activation code", @"enter registration code",
@@ -379,6 +406,14 @@ std::string ruleFor(const Signals& signals, bool image = false)
     if (signals.help) return {};
     if (!signals.explicitRule.empty()) return signals.explicitRule;
     if (signals.licensed) return {};
+    if (!signals.messageRule.empty() && signals.action && signals.dismiss)
+        return signals.messageRule;
+    // A license dialog can authorize through iLok/a browser and contain no
+    // serial-number field. Require both an explicit requirement heading and
+    // separate activate/dismiss actions; an editor's permanent Activate button
+    // or a preset named "Activation Required" does not satisfy this rule.
+    if (signals.activationRequired && signals.action && signals.dismiss)
+        return "product_not_activated";
     // A bare state-like label may be a preset name even when exposed as AX
     // static text. It is never evidence, including beside a permanent Activate
     // button. Use a complete status phrase or the full form conjunction below.
@@ -429,7 +464,9 @@ std::string matchStatusText(std::string_view raw, std::string_view productName)
             if ([text isEqualToString:[subject stringByAppendingString:@" is not registered"]]) return "product_not_registered";
             if ([text isEqualToString:[subject stringByAppendingString:@" is unregistered"]]) return "product_not_registered";
             if ([text isEqualToString:[subject stringByAppendingString:@" is unlicensed"]]) return "unlicensed_status";
+            if ([text isEqualToString:[subject stringByAppendingString:@" is not licensed"]]) return "unlicensed_status";
             if ([text isEqualToString:[subject stringByAppendingString:@" is not authorized"]]) return "product_not_activated";
+            if ([text isEqualToString:[subject stringByAppendingString:@" requires activation"]]) return "product_not_activated";
             for (NSString* ending in @[@" is running in demo mode", @" is running in trial mode",
                                        @" is in demo mode", @" is in trial mode",
                                        @" is running in evaluation mode"])
@@ -437,6 +474,11 @@ std::string matchStatusText(std::string_view raw, std::string_view productName)
         }
         if (product.length > 0 && [text isEqualToString:[@"this is an unregistered version of " stringByAppendingString:product]])
             return "product_not_registered";
+        // UA documents this exact native plug-in error. Restrict the short
+        // heading to UADx product identity, not arbitrary preset/control text.
+        // "Activate License" on its own is also a normal action, not evidence.
+        if ([product hasPrefix:@"uadx "] && isOneOf(text, @[@"plug-in not licensed", @"plugin not licensed"]))
+            return "unlicensed_status";
         if (isOneOf(text, @[@"license has expired", @"your license has expired", @"the license has expired",
                            @"your trial license has expired", @"the trial license has expired",
                            @"license expired", @"license status: expired"])) return "license_expired";
@@ -524,7 +566,7 @@ ProbeResult inspectLocalRoots(NSArray* roots, std::string_view productName, Limi
                 if (timedOut()) { result.budgetExhausted = true; break; }
                 if ([role isEqualToString:NSAccessibilityStaticTextRole])
                 {
-                    ++result.staticTextNodes;
+                    bool readableText = false;
                     // Text is transient and never returned/logged. Only read
                     // values of static, unprotected text, never input values.
                     for (SEL selector : {@selector(accessibilityTitle), @selector(accessibilityLabel), @selector(accessibilityValue)})
@@ -536,8 +578,11 @@ ProbeResult inspectLocalRoots(NSArray* roots, std::string_view productName, Limi
                         else if (selector == @selector(accessibilityLabel)) candidate = [object accessibilityLabel];
                         else candidate = [object accessibilityValue];
                         if (timedOut()) { result.budgetExhausted = true; break; }
+                        if ([candidate isKindOfClass:NSString.class] && [candidate length] <= 256)
+                            readableText |= normalized(utf8(candidate)).length > 0;
                         textSignals(signals, candidate, productName);
                     }
+                    if (readableText) ++result.staticTextNodes;
                 }
                 if (current.depth >= limits.maxDepth) { result.budgetExhausted = true; continue; }
                 if (timedOut()) { result.budgetExhausted = true; break; }
@@ -565,8 +610,17 @@ ProbeResult inspectLocalRoots(NSArray* roots, std::string_view productName, Limi
         if (!result.budgetExhausted)
             for (const auto& signals : scopes)
                 if (auto rule = ruleFor(signals); !rule.empty()) { result.rule = rule; break; }
+        result.contentObserved = !result.budgetExhausted && result.staticTextNodes > 0;
         result.diagnostic = !result.rule.empty() ? "ax_matched"
             : result.budgetExhausted ? "ax_incomplete" : "ax_no_supported_status";
+        if (result.rule.empty())
+            for (const auto& signals : scopes)
+                if (signals.uadDSPDisabled)
+                {
+                    result.diagnostic = "uad_dsp_disabled";
+                    result.contentObserved = false;
+                    break;
+                }
     }
     return result;
 }
@@ -751,6 +805,8 @@ static ProbeResult recognizeImageWithBudget(NSImage* image, std::string_view pro
             NSArray<VNRecognizedTextObservation*>* observations = request.results;
             if (observations.count > 256) { result.diagnostic = "ocr_text_limit"; return result; }
             Signals signals;
+            struct OCRLine { NSString* text; CGRect bounds; };
+            std::vector<OCRLine> lines;
             // Inspect the entire bounded result set before accepting a match.
             // A help/FAQ heading later in the set must still veto an earlier hit.
             for (VNRecognizedTextObservation* observation in observations)
@@ -760,9 +816,38 @@ static ProbeResult recognizeImageWithBudget(NSImage* image, std::string_view pro
                 ++result.staticTextNodes;
                 textSignals(signals, text.string, productName);
                 textSignals(signals, text.string, productName, true);
+                lines.push_back({text.string, observation.boundingBox});
+            }
+            // Vision returns wrapped paragraphs as separate observations. Join
+            // only short, consecutive, left-aligned lines in the same column;
+            // never combine arbitrary text from opposite parts of an editor.
+            // Status matching still requires a complete fixed phrase. A
+            // question/help prefix remains part of the phrase and cannot match.
+            std::stable_sort(lines.begin(), lines.end(), [](const auto& a, const auto& b) {
+                return CGRectGetMidY(a.bounds) > CGRectGetMidY(b.bounds);
+            });
+            for (std::size_t start = 0; start < lines.size(); ++start)
+            {
+                NSString* joined = lines[start].text;
+                for (std::size_t end = start + 1; end < lines.size() && end < start + 3; ++end)
+                {
+                    const auto& previous = lines[end - 1].bounds;
+                    const auto& next = lines[end].bounds;
+                    const double height = std::max(previous.size.height, next.size.height);
+                    const double gap = CGRectGetMinY(previous) - CGRectGetMaxY(next);
+                    if (height <= 0 || gap < -height * 0.25 || gap > height * 1.6
+                        || std::abs(previous.origin.x - next.origin.x) > height * 1.2) break;
+                    joined = [joined stringByAppendingFormat:@" %@", lines[end].text];
+                    if (joined.length > 256) break;
+                    textSignals(signals, joined, productName);
+                }
             }
             result.rule = ruleFor(signals, true);
+            result.contentObserved = result.staticTextNodes > 0;
             if (!result.rule.empty()) result.diagnostic = "ocr_matched";
+            else if (signals.uadDSPDisabled)
+            { result.diagnostic = "uad_dsp_disabled"; result.contentObserved = false; }
+            else if (!result.contentObserved) result.diagnostic = "ocr_no_text";
         }
         @catch (NSException*) { result.diagnostic = "ocr_recognition_exception"; }
     }
@@ -771,8 +856,11 @@ static ProbeResult recognizeImageWithBudget(NSImage* image, std::string_view pro
 
 ProbeResult recognizeLocalImage(NSImage* image, std::string_view productName, double sampledAt)
 {
-    if (isRosettaProcess()) return recognizeInNativeWorker(image, productName, sampledAt);
-    return recognizeImageWithBudget(image, productName, sampledAt, ocrBudgetMilliseconds);
+    // Vision must never share the vendor plug-in process. Some plug-ins change
+    // process-wide rendering/runtime state, and a cancelled native Vision
+    // request may never return. The owned child has a hard lifetime bound and
+    // is reaped before another sample starts, on both arm64 and Rosetta hosts.
+    return recognizeInNativeWorker(image, productName, sampledAt);
 }
 
 int runNativeOCRWarmup(int expectedParentPID)
@@ -927,7 +1015,8 @@ int runNativeOCRWorker(int expectedParentPID)
             CGImageRelease(cg);
             if (image == nil) return 2;
             const std::string productName(static_cast<const char*>(productBytes.bytes), productBytes.length);
-            const ProbeResult result = recognizeLocalImage(image, productName, sampledAt);
+            // Already in the isolated native process: do not spawn recursively.
+            const ProbeResult result = recognizeImageWithBudget(image, productName, sampledAt, ocrBudgetMilliseconds);
             NSString* rule = [NSString stringWithUTF8String:result.rule.c_str()];
             NSString* diagnostic = [NSString stringWithUTF8String:result.diagnostic.c_str()];
             if (!validRule(rule) || !validOCRDiagnostic(diagnostic) || result.staticTextNodes > 256
@@ -961,6 +1050,12 @@ ProbeResult inspectOwnVisibleWindows(std::string_view productName, Limits limits
                 [roots addObject:window];
         auto native = inspectLocalRoots(roots, productName, limits);
         if (!allowOCR || !native.rule.empty()) return native;
+        const bool uadDSPDisabled = native.diagnostic == "uad_dsp_disabled";
+        // When the scan needs the rendered fallback, partial AX labels are not
+        // a substitute for that observation (for example the host's heading
+        // around an otherwise blank GPU editor). Only a consumed OCR result
+        // can mark this fallback attempt as readable.
+        native.contentObserved = false;
         monitorScanInteraction();
         if (userInteracted) { native.diagnostic = "ocr_user_interaction"; return native; }
         static PADLicenseOCRState* state = [PADLicenseOCRState new];
@@ -1021,7 +1116,15 @@ ProbeResult inspectOwnVisibleWindows(std::string_view productName, Limits limits
                 break;
             }
         }
-        if (hasCompleted) return completed; // Consume a captured observation once.
+        if (hasCompleted)
+        {
+            // Explicit license evidence has priority over the ambiguous DSP
+            // status. Otherwise a disabled editor is never a clean inspection,
+            // even if another part of its rendered UI contains readable text.
+            if (completed.rule.empty() && uadDSPDisabled)
+            { completed.diagnostic = "uad_dsp_disabled"; completed.contentObserved = false; }
+            return completed; // Consume a captured observation once.
+        }
         native.pending = state.busy || intervalWait;
         if (native.pending) { native.sampledAtMilliseconds = 0; native.diagnostic = state.busy ? "ocr_pending" : "ocr_sampling_interval"; }
         return native;

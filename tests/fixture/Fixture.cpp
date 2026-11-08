@@ -3,6 +3,7 @@
 // It never opens an audio/MIDI device, performs network I/O, or reads licenses.
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_extra/juce_gui_extra.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 namespace
 {
@@ -20,8 +21,21 @@ public:
         .withInput("Input", juce::AudioChannelSet::stereo(), true)
         .withOutput("Output", juce::AudioChannelSet::stereo(), true)) { recordFixtureEvent("processor_created"); }
     const juce::String getName() const override { return "Plugin Auth Desk Fixture"; }
-    void prepareToPlay(double, int) override { recordFixtureEvent("audio_prepared"); }
-    void releaseResources() override {}
+    void prepareToPlay(double, int) override
+    {
+        prepared = true; recordFixtureEvent("processor_initialized");
+        const auto stopPath = juce::SystemStats::getEnvironmentVariable("PAD_FIXTURE_QUIT_DURING_INITIALIZATION", "");
+        if (juce::File::isAbsolutePath(stopPath))
+        {
+            // Synthetic nested initialization loop. Only the runner's isolated
+            // temporary stop file is written; no UI click/license is involved.
+            juce::File(stopPath).replaceWithText("synthetic stop during initialization\n");
+            recordFixtureEvent("stop_requested_during_initialization");
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.75, false);
+            recordFixtureEvent("initialization_returned_after_nested_loop");
+        }
+    }
+    void releaseResources() override { prepared = false; recordFixtureEvent("processor_released"); }
     void processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) override { recordFixtureEvent("audio_processed"); buffer.clear(); }
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return false; }
@@ -35,6 +49,9 @@ public:
     void setStateInformation(const void*, int) override {}
     bool hasEditor() const override { return true; }
     juce::AudioProcessorEditor* createEditor() override;
+    bool isInitialized() const { return prepared; }
+private:
+    bool prepared = false;
 };
 
 class FixtureEditor final : public juce::AudioProcessorEditor, private juce::Timer
@@ -43,6 +60,7 @@ public:
     explicit FixtureEditor(FixtureProcessor& processor) : AudioProcessorEditor(processor)
     {
         recordFixtureEvent("editor_created");
+        if (!processor.isInitialized()) recordFixtureEvent("editor_before_initialization");
         paintedOnly = juce::SystemStats::getEnvironmentVariable("PAD_FIXTURE_PAINTED", "0") == "1";
         const int delay = juce::jlimit(0, 15000, juce::SystemStats::getEnvironmentVariable("PAD_FIXTURE_DELAY_MS", "0").getIntValue());
         const auto clearPath = juce::SystemStats::getEnvironmentVariable("PAD_FIXTURE_CLEAR_REQUEST", "");

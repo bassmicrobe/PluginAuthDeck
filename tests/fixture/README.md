@@ -16,6 +16,8 @@ python3 tests/fixture/verify_installed_host.py
 python3 tests/fixture/verify_installed_host.py --variant delayed
 python3 tests/fixture/verify_installed_host.py --variant transient
 python3 tests/fixture/verify_installed_host.py --factory-metadata
+python3 tests/fixture/verify_installed_host.py --editor-only
+python3 tests/fixture/verify_installed_host.py --cancel-during-initialization
 python3 tests/fixture/verify_installed_host.py --ocr-only
 python3 tests/fixture/verify_installed_host.py --ocr-only --variant delayed
 python3 tests/fixture/verify_installed_host.py --ocr-only --architecture x86_64
@@ -40,7 +42,14 @@ requires the host to remove the candidate without producing license evidence.
 It does not send UI clicks or write any production status.
 
 Every variant verifies that exactly one processor and editor are created and
-that neither audio preparation nor audio processing is called. The
+that audio processing is never called. Normal runs require processor initialization
+before editor creation and resource release during teardown. `--editor-only`
+exercises the explicit initialization opt-out for compatibility comparisons. The
+`--cancel-during-initialization` case writes only its temporary stop request from
+inside processor initialization and pumps a short native nested loop. It requires
+that cancellation prevents all editor creation and ready/evidence publication,
+and that the retained child exits within the stop bound. No OCR is requested.
+The
 `--factory-metadata` variant removes `moduleinfo.json` from the temporary staged
 copy before signing. This exercises VST3 factory metadata enumeration and catches
 the previous extra processor creation during JUCE's slow enumeration path.
